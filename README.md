@@ -21,12 +21,19 @@ nix profile install github:DoeringChristian/sshr
 
 ### Manual
 
-Clone and add `bin/` to your PATH:
+Build from source and install the executable together with its runtime assets:
 
 ```bash
 git clone https://github.com/DoeringChristian/sshr.git
-export PATH="$PWD/sshr/bin:$PATH"
+cd sshr
+cargo build --release
+
+mkdir -p "$HOME/.local/bin" "$HOME/.local/share/sshr"
+install -m 755 target/release/sshr "$HOME/.local/bin/sshr"
+cp -R shpool kitty "$HOME/.local/share/sshr/"
 ```
+
+Ensure `$HOME/.local/bin` is on your `PATH`. Installing the `shpool` directory under `$HOME/.local/share/sshr/` is required for automatic uploads to remote hosts.
 
 ## Usage
 
@@ -67,7 +74,7 @@ The general form is `sshr [flags] <host> [subcommand] [args...]`. Session names 
 
 ## Shell Support
 
-sshr deploys lightweight init files to the remote (`~/.local/share/sshr/init/`) that add OSC 7 CWD reporting to your shell. This enables features like opening new windows in the same remote directory. Supported shells:
+By default, sshr deploys lightweight init files to the configured remote data directory (`~/.local/share/sshr/init/`) that add OSC 7 CWD reporting to your shell. This enables features like opening new windows in the same remote directory. Set `shell_integration = false` to disable these hooks. Supported shells:
 
 - **bash** — init via `ENV` + POSIX mode
 - **zsh** — init via `ZDOTDIR`
@@ -117,7 +124,9 @@ delegate = "ssh"
 
 **delegate** — Skip sshr for this host and run the specified command instead (e.g. `"ssh"` for plain SSH).
 
-**shell_integration** — Toggle OSC 7 CWD reporting injection (`true`/`false`). Default: `true`.
+**remote_dir** — Directory under the remote home directory where sshr installs shpool and its shell-init files. Default: `".local/share/sshr"`. A leading `~/` or `/` is accepted and resolved relative to the remote home directory, matching Kitty's SSH kitten behavior.
+
+**shell_integration** — Toggle OSC 7 CWD reporting injection (`true`/`false`). Default: `true`. Disabling it avoids sshr's shell-init hooks, but features that depend on knowing the remote working directory, such as Kitty smart launch, will not preserve that directory.
 
 ### `[env]`
 

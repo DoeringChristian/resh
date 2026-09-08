@@ -401,7 +401,10 @@ exclude = ["*.jpg", "*.bmp"]
 "#,
         );
         assert_eq!(cfg.defaults.copy.len(), 2);
-        assert_eq!(cfg.defaults.copy[0].dest.as_deref(), Some("my-conf/vim/vimrc"));
+        assert_eq!(
+            cfg.defaults.copy[0].dest.as_deref(),
+            Some("my-conf/vim/vimrc")
+        );
         assert!(cfg.defaults.copy[1].glob);
         assert_eq!(cfg.defaults.copy[1].excludes, vec!["*.jpg", "*.bmp"]);
     }
@@ -441,6 +444,26 @@ shell_integration = false
         );
         let host_cfg = cfg.for_host("server");
         assert_eq!(host_cfg.shell_integration, Some(false));
+    }
+
+    #[test]
+    fn test_remote_dir() {
+        let cfg = parse(
+            r#"
+remote_dir = ".local/share/custom-sshr"
+
+[hosts.server]
+remote_dir = "opt/sshr"
+"#,
+        );
+        assert_eq!(
+            cfg.for_host("other").remote_dir.as_deref(),
+            Some(".local/share/custom-sshr")
+        );
+        assert_eq!(
+            cfg.for_host("server").remote_dir.as_deref(),
+            Some("opt/sshr")
+        );
     }
 
     #[test]

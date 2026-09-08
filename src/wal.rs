@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::session;
 use crate::ssh::SshContext;
+use crate::upload::RemotePaths;
 use crate::vlog;
 
 pub fn wal_path() -> PathBuf {
@@ -57,7 +58,7 @@ fn write_entries(entries: &[WalEntry]) -> Result<()> {
 
 /// Record that a session should be closed. Tries to kill immediately;
 /// if that fails the entry stays for replay on next connect.
-pub fn record_close(ssh: &SshContext, host: &str, session_name: &str) {
+pub fn record_close(ssh: &SshContext, host: &str, session_name: &str, paths: &RemotePaths) {
     let mut entries = read_entries();
     entries.push(WalEntry {
         host: host.to_string(),
@@ -69,13 +70,13 @@ pub fn record_close(ssh: &SshContext, host: &str, session_name: &str) {
     }
     vlog!("wal: recorded close for {host}:{session_name}");
 
-    if session::kill_sessions(ssh, host, &[session_name.to_string()]).is_ok() {
+    if session::kill_sessions(ssh, host, &[session_name.to_string()], paths).is_ok() {
         remove_entry(host, session_name);
     }
 }
 
 /// Replay pending close operations for a host. Called on connect.
-pub fn replay(ssh: &SshContext, host: &str) {
+pub fn replay(ssh: &SshContext, host: &str, paths: &RemotePaths) {
     let entries = read_entries();
     let pending: Vec<&WalEntry> = entries.iter().filter(|e| e.host == host).collect();
     if pending.is_empty() {
@@ -89,7 +90,7 @@ pub fn replay(ssh: &SshContext, host: &str) {
         names.join(", ")
     );
 
-    if session::kill_sessions(ssh, host, &names).is_ok() {
+    if session::kill_sessions(ssh, host, &names, paths).is_ok() {
         let remaining: Vec<WalEntry> = entries.into_iter().filter(|e| e.host != host).collect();
         let _ = write_entries(&remaining);
         vlog!("wal: flushed entries for {host}");

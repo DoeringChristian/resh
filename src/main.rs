@@ -16,6 +16,7 @@ use owo_colors::OwoColorize;
 
 use config::HostConfig;
 use ssh::SshContext;
+use upload::RemotePaths;
 
 fn set_user_var(key: &str, value: &str) {
     let encoded = base64::engine::general_purpose::STANDARD.encode(value);
@@ -72,21 +73,21 @@ fn run() -> Result<()> {
     let host = &cli.host;
     let subcmd = cli.args.first().map(|s| s.as_str());
 
+    let host_cfg = cfg.for_host(host);
+
     match subcmd {
-        Some("list" | "ls") => cmd_list(host, cli.all),
+        Some("list" | "ls") => cmd_list(host, cli.all, &host_cfg),
         Some("attach") => {
             let ssh_args: Vec<String> = cli.args[1..].to_vec();
-            let host_cfg = cfg.for_host(host);
             cmd_connect(host, &ssh_args, true, &cli, host_cfg)
         }
         Some("kill") => {
             let sessions: Vec<String> = cli.args[1..].to_vec();
-            cmd_kill(host, &sessions, cli.all)
+            cmd_kill(host, &sessions, cli.all, &host_cfg)
         }
-        Some("clean") => cmd_clean(host, cli.all),
+        Some("clean") => cmd_clean(host, cli.all, &host_cfg),
         _ => {
             let ssh_args = cli.args.clone();
-            let host_cfg = cfg.for_host(host);
             cmd_connect(host, &ssh_args, false, &cli, host_cfg)
         }
     }
@@ -98,13 +99,15 @@ fn ensure_remote_shpool(
     extra_args: &[String],
     force_upload: bool,
     host_cfg: &HostConfig,
+    paths: &RemotePaths,
 ) -> Result<()> {
-    upload::ensure_shpool(ssh, host, extra_args, force_upload, host_cfg)
+    upload::ensure_shpool(ssh, host, extra_args, force_upload, host_cfg, paths)
 }
 
-fn cmd_list(host: &str, all: bool) -> Result<()> {
+fn cmd_list(host: &str, all: bool, host_cfg: &HostConfig) -> Result<()> {
     let ssh = SshContext::new()?;
-    let sessions = session::list_sessions(&ssh, host, &[])?;
+    let paths = RemotePaths::new(host_cfg.remote_dir.as_deref())?;
+    let sessions = session::list_sessions(&ssh, host, &[], &paths)?;
     let prefix = session::local_prefix();
     let filtered: Vec<&session::SessionEntry> = sessions
         .iter()
@@ -121,20 +124,22 @@ fn cmd_list(host: &str, all: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_kill(host: &str, sessions: &[String], all: bool) -> Result<()> {
+fn cmd_kill(host: &str, sessions: &[String], all: bool, host_cfg: &HostConfig) -> Result<()> {
     let ssh = SshContext::new()?;
+    let paths = RemotePaths::new(host_cfg.remote_dir.as_deref())?;
     let to_kill = if sessions.is_empty() {
-        session::pick_sessions_to_kill(&ssh, host, all)?
+        session::pick_sessions_to_kill(&ssh, host, all, &paths)?
     } else {
         sessions.to_vec()
     };
 
-    session::kill_sessions(&ssh, host, &to_kill)
+    session::kill_sessions(&ssh, host, &to_kill, &paths)
 }
 
-fn cmd_clean(host: &str, all: bool) -> Result<()> {
+fn cmd_clean(host: &str, all: bool, host_cfg: &HostConfig) -> Result<()> {
     let ssh = SshContext::new()?;
-    session::clean_detached(&ssh, host, all)
+    let paths = RemotePaths::new(host_cfg.remote_dir.as_deref())?;
+    session::clean_detached(&ssh, host, all, &paths)
 }
 
 fn cmd_connect(
@@ -154,23 +159,24 @@ fn cmd_connect(
     }
 
     let ssh = SshContext::new()?;
+    let paths = RemotePaths::new(host_cfg.remote_dir.as_deref())?;
 
     set_user_var("sshr_host", host);
 
     ssh.clean_stale_master(host, ssh_args);
 
-    ensure_remote_shpool(&ssh, host, ssh_args, cli.force_upload, &host_cfg)?;
+    ensure_remote_shpool(&ssh, host, ssh_args, cli.force_upload, &host_cfg, &paths)?;
 
-    wal::replay(&ssh, host);
+    wal::replay(&ssh, host, &paths);
 
     if !host_cfg.copy.is_empty() {
         copy::run_copy_directives(&ssh, host, ssh_args, &host_cfg.copy)?;
     }
 
     let session_name = if attach {
-        session::pick_session_interactive(&ssh, host, ssh_args, cli.all)?
+        session::pick_session_interactive(&ssh, host, ssh_args, cli.all, &paths)?
     } else {
-        session::new_session_name(&ssh, host, ssh_args)?
+        session::new_session_name(&ssh, host, ssh_args, &paths)?
     };
 
     set_user_var("sshr_session", &session_name);
@@ -179,6 +185,7 @@ fn cmd_connect(
     let remote_cwd = cli.remote_cwd.clone().or(host_cfg.cwd.clone());
 
     let remote_cmd = cmd::build_shpool_cmd(
+        &paths,
         &session_name,
         shell.as_deref(),
         remote_cwd.as_deref(),
@@ -197,7 +204,7 @@ fn cmd_connect(
         || ssh.clean_stale_master(host, ssh_args),
     );
 
-    wal::record_close(&ssh, host, &session_name);
+    wal::record_close(&ssh, host, &session_name, &paths);
 
     set_user_var("sshr_host", "");
     set_user_var("sshr_session", "");

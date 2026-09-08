@@ -4,7 +4,7 @@ use owo_colors::OwoColorize;
 use std::collections::HashSet;
 
 use crate::ssh::SshContext;
-use crate::upload::{REMOTE_SHPOOL_PATH, REMOTE_SOCKET_PATH};
+use crate::upload::RemotePaths;
 use crate::vlog;
 
 pub fn local_prefix() -> String {
@@ -41,9 +41,12 @@ pub fn list_sessions(
     ssh: &SshContext,
     host: &str,
     extra_args: &[String],
+    paths: &RemotePaths,
 ) -> Result<Vec<SessionEntry>> {
     let cmd = format!(
-        "{REMOTE_SHPOOL_PATH} --socket {REMOTE_SOCKET_PATH} list 2>/dev/null"
+        "{} --socket {} list 2>/dev/null",
+        paths.shpool(),
+        paths.socket()
     );
     let output = ssh.run_capture(host, extra_args, &cmd)?;
     Ok(parse_session_list(&output))
@@ -68,9 +71,10 @@ pub fn new_session_name(
     ssh: &SshContext,
     host: &str,
     extra_args: &[String],
+    paths: &RemotePaths,
 ) -> Result<String> {
     let prefix = local_prefix();
-    let sessions = list_sessions(ssh, host, extra_args)?;
+    let sessions = list_sessions(ssh, host, extra_args, paths)?;
     let existing: HashSet<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
     loop {
         let id: u32 = rand::random();
@@ -87,9 +91,10 @@ pub fn pick_session_interactive(
     host: &str,
     extra_args: &[String],
     all: bool,
+    paths: &RemotePaths,
 ) -> Result<String> {
     let prefix = local_prefix();
-    let sessions: Vec<_> = list_sessions(ssh, host, extra_args)?
+    let sessions: Vec<_> = list_sessions(ssh, host, extra_args, paths)?
         .into_iter()
         .filter(|s| all || s.name.starts_with(&format!("{prefix}-")))
         .collect();
@@ -113,9 +118,10 @@ pub fn pick_sessions_to_kill(
     ssh: &SshContext,
     host: &str,
     all: bool,
+    paths: &RemotePaths,
 ) -> Result<Vec<String>> {
     let prefix = local_prefix();
-    let sessions: Vec<_> = list_sessions(ssh, host, &[])?
+    let sessions: Vec<_> = list_sessions(ssh, host, &[], paths)?
         .into_iter()
         .filter(|s| all || s.name.starts_with(&format!("{prefix}-")))
         .collect();
@@ -140,17 +146,20 @@ pub fn kill_sessions(
     ssh: &SshContext,
     host: &str,
     sessions: &[String],
+    paths: &RemotePaths,
 ) -> Result<()> {
     let session_list = sessions.join(" ");
     let cmd = format!(
-        "{REMOTE_SHPOOL_PATH} --socket {REMOTE_SOCKET_PATH} kill {session_list}"
+        "{} --socket {} kill {session_list}",
+        paths.shpool(),
+        paths.socket()
     );
     ssh.run_capture(host, &[], &cmd)?;
     Ok(())
 }
 
-pub fn clean_detached(ssh: &SshContext, host: &str, all: bool) -> Result<()> {
-    let sessions = list_sessions(ssh, host, &[])?;
+pub fn clean_detached(ssh: &SshContext, host: &str, all: bool, paths: &RemotePaths) -> Result<()> {
+    let sessions = list_sessions(ssh, host, &[], paths)?;
     let prefix = local_prefix();
     let detached: Vec<&str> = sessions
         .iter()
@@ -164,12 +173,9 @@ pub fn clean_detached(ssh: &SshContext, host: &str, all: bool) -> Result<()> {
         return Ok(());
     }
 
-    eprintln!(
-        "Killing detached sessions: {}",
-        detached.join(", ").green()
-    );
+    eprintln!("Killing detached sessions: {}", detached.join(", ").green());
     let names: Vec<String> = detached.iter().map(|s| s.to_string()).collect();
-    kill_sessions(ssh, host, &names)
+    kill_sessions(ssh, host, &names, paths)
 }
 
 #[cfg(test)]
