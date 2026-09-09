@@ -1,6 +1,7 @@
 mod cmd;
 mod config;
 mod copy;
+mod posix;
 mod reconnect;
 mod session;
 mod signal;
@@ -118,7 +119,7 @@ fn cmd_list(host: &str, all: bool, host_cfg: &HostConfig) -> Result<()> {
         eprintln!("No sessions.");
     } else {
         for entry in filtered {
-            println!("{}", entry.raw_line);
+            println!("{}", entry.display_line());
         }
     }
     Ok(())
@@ -199,15 +200,16 @@ fn cmd_connect(
         session_name.green().bold()
     );
 
-    let result = reconnect::run_with_reconnect(
+    let code = reconnect::run_with_reconnect(
         || ssh.run_interactive(host, ssh_args, Some(&remote_cmd)),
         || ssh.clean_stale_master(host, ssh_args),
-    );
+    )?;
 
     wal::record_close(&ssh, host, &session_name, &paths);
 
     set_user_var("sshr_host", "");
     set_user_var("sshr_session", "");
 
-    result
+    // Propagate the remote shell's exit status as sshr's own.
+    std::process::exit(code);
 }

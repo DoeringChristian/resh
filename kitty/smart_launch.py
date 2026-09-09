@@ -5,7 +5,7 @@ window to the same host in the same working directory. Otherwise falls
 back to launching a local window with cwd=current.
 """
 
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 
 def main(args):
@@ -32,7 +32,9 @@ def handle_result(args, answer, target_window_id, boss):
         osc7_url = window.screen.last_reported_cwd
         if osc7_url:
             url = osc7_url.decode() if isinstance(osc7_url, bytes) else osc7_url
-            remote_cwd = urlparse(url).path
+            # sshr percent-encodes the path in the OSC 7 URL so spaces, '#', and
+            # '?' survive; decode it back before handing it to --remote-cwd.
+            remote_cwd = unquote(urlparse(url).path)
 
         cmd = ["sshr"]
         if remote_cwd:

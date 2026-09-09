@@ -65,6 +65,13 @@ impl RemotePaths {
         self.home_path("init/launch.sh")
     }
 
+    /// The launcher path relative to the remote HOME (no `$HOME` prefix). Used
+    /// where the value is expanded by a shell we invoke ourselves rather than by
+    /// shpool, which execs its `-c` command directly without a shell.
+    pub fn launch_home_relative(&self) -> String {
+        format!("{}/init/launch.sh", self.remote_dir)
+    }
+
     pub fn init_dir(&self) -> String {
         self.home_path("init")
     }
@@ -252,18 +259,25 @@ esac"#
 set +o posix
 unset ENV
 [ -f ~/.bashrc ] && . ~/.bashrc
-__sshr_osc7() {{ printf '\033]7;file://%s%s\a' "$(hostname)" "$PWD"; }}
+__sshr_uri_path() {{ printf %s "$1" | LC_ALL=C od -An -v -t x1 | awk '{{ for (i = 1; i <= NF; i++) {{ b = toupper($i); if (b == "2F") printf "/"; else printf "%%%s", b }} }}'; }}
+__sshr_osc7() {{ printf '\033]7;file://%s' "$(hostname)"; __sshr_uri_path "$PWD"; printf '\a'; }}
 PROMPT_COMMAND="${{PROMPT_COMMAND:+$PROMPT_COMMAND; }}__sshr_osc7"
 SSHR_EOF
 cat > {} << 'SSHR_EOF'
 ZDOTDIR="$HOME"
 [ -f "$ZDOTDIR/.zshenv" ] && . "$ZDOTDIR/.zshenv"
-__sshr_osc7() {{ printf '\033]7;file://%s%s\a' "$(hostname)" "$PWD" }}
+__sshr_uri_path() {{ printf %s "$1" | LC_ALL=C od -An -v -t x1 | awk '{{ for (i = 1; i <= NF; i++) {{ b = toupper($i); if (b == "2F") printf "/"; else printf "%%%s", b }} }}'; }}
+__sshr_osc7() {{ printf '\033]7;file://%s' "$(hostname)"; __sshr_uri_path "$PWD"; printf '\a' }}
 precmd_functions+=(__sshr_osc7)
 SSHR_EOF
 cat > {} << 'SSHR_EOF'
+function __sshr_uri_path
+    printf %s "$argv[1]" | env LC_ALL=C od -An -v -t x1 | awk '{{ for (i = 1; i <= NF; i++) {{ b = toupper($i); if (b == "2F") printf "/"; else printf "%%%s", b }} }}'
+end
 function __sshr_osc7 --on-event fish_prompt
-    printf '\e]7;file://%s%s\a' (hostname) $PWD
+    printf '\e]7;file://%s' (hostname)
+    __sshr_uri_path "$PWD"
+    printf '\a'
 end
 SSHR_EOF
 "#,

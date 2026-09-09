@@ -1,8 +1,10 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use dialoguer::{MultiSelect, Select};
 use owo_colors::OwoColorize;
+use serde::Deserialize;
 use std::collections::HashSet;
 
+use crate::posix::quote;
 use crate::ssh::SshContext;
 use crate::upload::RemotePaths;
 use crate::vlog;
@@ -31,10 +33,52 @@ fn stable_hostname() -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
-#[derive(Debug, Clone)]
+/// Whether a session currently has a client attached. `#[serde(other)]` keeps
+/// parsing forward-compatible: a status spelling shpool adds in a future release
+/// deserializes to `Unknown` instead of failing the whole list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+pub enum SessionStatus {
+    Attached,
+    Disconnected,
+    #[serde(other)]
+    #[default]
+    Unknown,
+}
+
+impl SessionStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Attached => "attached",
+            Self::Disconnected => "disconnected",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct SessionEntry {
     pub name: String,
-    pub raw_line: String,
+    #[serde(default)]
+    pub status: SessionStatus,
+    #[serde(default)]
+    pub started_at_unix_ms: Option<i64>,
+}
+
+impl SessionEntry {
+    /// One-line rendering for `sshr <host> list`.
+    pub fn display_line(&self) -> String {
+        let started = self
+            .started_at_unix_ms
+            .map(|ms| ms.to_string())
+            .unwrap_or_else(|| "-".into());
+        format!("{}\t{}\t{}", self.name, started, self.status.as_str())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionList {
+    #[serde(default)]
+    sessions: Vec<SessionEntry>,
 }
 
 pub fn list_sessions(
@@ -44,27 +88,23 @@ pub fn list_sessions(
     paths: &RemotePaths,
 ) -> Result<Vec<SessionEntry>> {
     let cmd = format!(
-        "{} --socket {} list 2>/dev/null",
+        "{} --socket {} list --json 2>/dev/null",
         paths.shpool(),
         paths.socket()
     );
     let output = ssh.run_capture(host, extra_args, &cmd)?;
-    Ok(parse_session_list(&output))
+    parse_session_list(&output)
 }
 
-fn parse_session_list(output: &str) -> Vec<SessionEntry> {
-    output
-        .lines()
-        .skip(1) // skip header
-        .filter(|l| !l.trim().is_empty())
-        .map(|line| {
-            let name = line.split_whitespace().next().unwrap_or("").to_string();
-            SessionEntry {
-                name,
-                raw_line: line.to_string(),
-            }
-        })
-        .collect()
+fn parse_session_list(output: &str) -> Result<Vec<SessionEntry>> {
+    // No daemon / no sessions can yield empty stdout; treat that as no sessions
+    // rather than a parse error.
+    if output.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let reply: SessionList =
+        serde_json::from_str(output).context("invalid shpool list --json response")?;
+    Ok(reply.sessions)
 }
 
 pub fn new_session_name(
@@ -102,7 +142,7 @@ pub fn pick_session_interactive(
         bail!("no existing sessions on {}", host);
     }
 
-    let items: Vec<&str> = sessions.iter().map(|s| s.raw_line.as_str()).collect();
+    let items: Vec<String> = sessions.iter().map(|s| s.display_line()).collect();
     let idx = Select::new()
         .with_prompt("Attach to session")
         .items(&items)
@@ -129,7 +169,7 @@ pub fn pick_sessions_to_kill(
         bail!("no sessions on {}", host);
     }
 
-    let items: Vec<&str> = sessions.iter().map(|s| s.raw_line.as_str()).collect();
+    let items: Vec<String> = sessions.iter().map(|s| s.display_line()).collect();
     let indices = MultiSelect::new()
         .with_prompt("Kill sessions (space to toggle, enter to confirm)")
         .items(&items)
@@ -148,9 +188,15 @@ pub fn kill_sessions(
     sessions: &[String],
     paths: &RemotePaths,
 ) -> Result<()> {
-    let session_list = sessions.join(" ");
+    let session_list = sessions
+        .iter()
+        .map(|s| quote(s))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // `--` terminates option parsing so a session name beginning with `-` is
+    // never treated as a flag, and each name is quoted as one shell word.
     let cmd = format!(
-        "{} --socket {} kill {session_list}",
+        "{} --socket {} kill -- {session_list}",
         paths.shpool(),
         paths.socket()
     );
@@ -163,17 +209,20 @@ pub fn clean_detached(ssh: &SshContext, host: &str, all: bool, paths: &RemotePat
     let prefix = local_prefix();
     let detached: Vec<&str> = sessions
         .iter()
-        .filter(|s| s.raw_line.contains("detached"))
+        .filter(|s| s.status == SessionStatus::Disconnected)
         .filter(|s| all || s.name.starts_with(&format!("{prefix}-")))
         .map(|s| s.name.as_str())
         .collect();
 
     if detached.is_empty() {
-        eprintln!("No detached sessions.");
+        eprintln!("No disconnected sessions.");
         return Ok(());
     }
 
-    eprintln!("Killing detached sessions: {}", detached.join(", ").green());
+    eprintln!(
+        "Killing disconnected sessions: {}",
+        detached.join(", ").green()
+    );
     let names: Vec<String> = detached.iter().map(|s| s.to_string()).collect();
     kill_sessions(ssh, host, &names, paths)
 }
@@ -183,20 +232,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_session_list() {
-        let output = "NAME    STARTED_AT      STATUS\n\
-                       s0    2026-05-22T18:02:29.300+00:00   attached\n\
-                       s1    2026-05-22T18:03:00.000+00:00   detached\n";
-        let sessions = parse_session_list(output);
+    fn parses_json_list_with_status_and_timestamps() {
+        let output = r#"{
+          "sessions": [
+            {"name": "s0", "started_at_unix_ms": 1779472949300, "status": "Attached"},
+            {"name": "s1", "started_at_unix_ms": 1779472980000, "status": "Disconnected"}
+          ]
+        }"#;
+        let sessions = parse_session_list(output).unwrap();
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].name, "s0");
+        assert_eq!(sessions[0].status, SessionStatus::Attached);
         assert_eq!(sessions[1].name, "s1");
+        assert_eq!(sessions[1].status, SessionStatus::Disconnected);
+        assert_eq!(
+            sessions[1].display_line(),
+            "s1\t1779472980000\tdisconnected"
+        );
     }
 
     #[test]
-    fn test_parse_empty_session_list() {
-        let output = "NAME    STARTED_AT      STATUS\n";
-        let sessions = parse_session_list(output);
-        assert!(sessions.is_empty());
+    fn empty_output_and_empty_session_array_are_no_sessions() {
+        assert!(parse_session_list("").unwrap().is_empty());
+        assert!(parse_session_list(r#"{"sessions":[]}"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_status_and_extra_fields_are_tolerated() {
+        let output =
+            r#"{"future":1,"sessions":[{"name":"s","status":"PausedForUpgrade","extra":true}]}"#;
+        let sessions = parse_session_list(output).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Unknown);
+    }
+
+    #[test]
+    fn malformed_json_is_an_error() {
+        assert!(parse_session_list("NAME STARTED STATUS").is_err());
     }
 }

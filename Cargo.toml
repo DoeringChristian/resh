@@ -15,8 +15,10 @@ libc = "0.2"
 dialoguer = "0.11"
 rand = "0.9"
 glob = "0.3"
-toml = "0.8"
+toml = { version = "0.8", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+indexmap = { version = "2", features = ["serde"] }
 
 [profile.release]
 strip = true

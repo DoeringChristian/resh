@@ -1,5 +1,5 @@
+use indexmap::IndexMap;
 use serde::Deserialize;
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -16,7 +16,7 @@ pub struct CopyDirective {
     pub excludes: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HostConfig {
     pub shell: Option<String>,
     pub env: Vec<EnvDirective>,
@@ -25,20 +25,6 @@ pub struct HostConfig {
     pub delegate: Option<String>,
     pub remote_dir: Option<String>,
     pub shell_integration: Option<bool>,
-}
-
-impl Default for HostConfig {
-    fn default() -> Self {
-        Self {
-            shell: None,
-            env: Vec::new(),
-            cwd: None,
-            copy: Vec::new(),
-            delegate: None,
-            remote_dir: None,
-            shell_integration: None,
-        }
-    }
 }
 
 // --- TOML schema ---
@@ -51,9 +37,9 @@ struct TomlConfig {
     delegate: Option<String>,
     remote_dir: Option<String>,
     shell_integration: Option<bool>,
-    env: Option<BTreeMap<String, String>>,
+    env: Option<IndexMap<String, String>>,
     copy: Option<Vec<TomlCopy>>,
-    hosts: Option<BTreeMap<String, TomlHostSection>>,
+    hosts: Option<IndexMap<String, TomlHostSection>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,7 +50,7 @@ struct TomlHostSection {
     delegate: Option<String>,
     remote_dir: Option<String>,
     shell_integration: Option<bool>,
-    env: Option<BTreeMap<String, String>>,
+    env: Option<IndexMap<String, String>>,
     copy: Option<Vec<TomlCopy>>,
 }
 
@@ -161,7 +147,7 @@ fn convert_toml(toml: TomlConfig) -> Config {
     Config { defaults, hosts }
 }
 
-fn convert_env(env: &Option<BTreeMap<String, String>>) -> Vec<EnvDirective> {
+fn convert_env(env: &Option<IndexMap<String, String>>) -> Vec<EnvDirective> {
     let Some(map) = env else { return Vec::new() };
     map.iter()
         .map(|(name, value)| {
@@ -255,7 +241,19 @@ fn merge_config(base: &mut HostConfig, overlay: &HostConfig) {
     if overlay.shell.is_some() {
         base.shell = overlay.shell.clone();
     }
-    base.env.extend(overlay.env.iter().cloned());
+    // Later matching sections override an earlier value for the same key in
+    // place, and add new keys in declaration order.
+    for directive in &overlay.env {
+        let EnvDirective::Set(name, _) = directive;
+        if let Some(existing) = base.env.iter_mut().find(|existing| {
+            let EnvDirective::Set(existing_name, _) = existing;
+            existing_name == name
+        }) {
+            *existing = directive.clone();
+        } else {
+            base.env.push(directive.clone());
+        }
+    }
     if overlay.cwd.is_some() {
         base.cwd = overlay.cwd.clone();
     }
@@ -306,12 +304,38 @@ BAZ = ""
 "#,
         );
         assert_eq!(cfg.defaults.env.len(), 2);
+        // IndexMap preserves declaration order: FOO was written before BAZ.
         let EnvDirective::Set(k, v) = &cfg.defaults.env[0];
-        assert_eq!(k, "BAZ"); // BTreeMap sorts alphabetically
-        assert_eq!(v, "");
-        let EnvDirective::Set(k, v) = &cfg.defaults.env[1];
         assert_eq!(k, "FOO");
         assert_eq!(v, "bar");
+        let EnvDirective::Set(k, v) = &cfg.defaults.env[1];
+        assert_eq!(k, "BAZ");
+        assert_eq!(v, "");
+    }
+
+    #[test]
+    fn later_host_section_env_overrides_in_place_and_appends_new_keys() {
+        let cfg = parse(
+            r#"
+[env]
+SHARED = "default"
+
+[hosts."server-*"]
+[hosts."server-*".env]
+SHARED = "override"
+EXTRA = "yes"
+"#,
+        );
+        let host = cfg.for_host("server-1");
+        let env: Vec<(&str, &str)> = host
+            .env
+            .iter()
+            .map(|d| {
+                let EnvDirective::Set(k, v) = d;
+                (k.as_str(), v.as_str())
+            })
+            .collect();
+        assert_eq!(env, [("SHARED", "override"), ("EXTRA", "yes")]);
     }
 
     #[test]

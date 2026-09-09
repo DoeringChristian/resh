@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::CopyDirective;
 use crate::ssh::SshContext;
@@ -63,7 +63,7 @@ pub fn run_copy_directives(
     Ok(())
 }
 
-fn resolve_sources(home: &PathBuf, copy: &CopyDirective) -> Result<Vec<PathBuf>> {
+fn resolve_sources(home: &Path, copy: &CopyDirective) -> Result<Vec<PathBuf>> {
     let parts: Vec<&str> = copy.src.split_whitespace().collect();
 
     if copy.glob {
@@ -74,12 +74,11 @@ fn resolve_sources(home: &PathBuf, copy: &CopyDirective) -> Result<Vec<PathBuf>>
             } else {
                 format!("{}/{pattern}", home.display())
             };
-            for entry in glob::glob(&full_pattern)
+            for path in glob::glob(&full_pattern)
                 .with_context(|| format!("invalid glob pattern: {full_pattern}"))?
+                .flatten()
             {
-                if let Ok(path) = entry {
-                    results.push(path);
-                }
+                results.push(path);
             }
         }
         Ok(results)

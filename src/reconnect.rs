@@ -25,12 +25,20 @@ fn reset_terminal() {
 /// `on_ssh_error` is called when SSH itself fails (exit 255), e.g. to tear down
 /// a broken ControlMaster. It is NOT called when the remote command exits
 /// non-zero, since the SSH connection may still be healthy (another session's master).
-pub fn run_with_reconnect<F, B>(connect: F, on_ssh_error: B) -> Result<()>
+/// Returns the exit code sshr should propagate: 0 on a clean session exit, or
+/// the last remote/SSH failure code when the loop ends via shutdown or the user
+/// declining to reconnect.
+pub fn run_with_reconnect<F, B>(connect: F, on_ssh_error: B) -> Result<i32>
 where
     F: Fn() -> Result<ExitStatus>,
     B: Fn(),
 {
-    run_reconnect_loop(connect, on_ssh_error, wait_for_keypress, crate::signal::is_closing)
+    run_reconnect_loop(
+        connect,
+        on_ssh_error,
+        wait_for_keypress,
+        crate::signal::is_closing,
+    )
 }
 
 pub(crate) fn run_reconnect_loop<F, B, W, C>(
@@ -38,27 +46,36 @@ pub(crate) fn run_reconnect_loop<F, B, W, C>(
     on_ssh_error: B,
     wait: W,
     is_closing: C,
-) -> Result<()>
+) -> Result<i32>
 where
     F: Fn() -> Result<ExitStatus>,
     B: Fn(),
     W: Fn() -> bool,
     C: Fn() -> bool,
 {
+    let mut last_failure = 1;
     loop {
         let mut status = connect()?;
         reset_terminal();
 
-        if status.success() || is_closing() {
-            break;
+        if status.success() {
+            return Ok(0);
+        }
+        last_failure = status.code().unwrap_or(last_failure);
+        if is_closing() {
+            return Ok(last_failure);
         }
 
         if status.code() == Some(255) {
             on_ssh_error();
             status = connect()?;
             reset_terminal();
-            if status.success() || is_closing() {
-                break;
+            if status.success() {
+                return Ok(0);
+            }
+            last_failure = status.code().unwrap_or(last_failure);
+            if is_closing() {
+                return Ok(last_failure);
             }
         }
 
@@ -78,13 +95,11 @@ where
         );
 
         if !wait() {
-            break;
+            return Ok(last_failure);
         }
 
         eprintln!("{}", "Reconnecting...".dimmed());
     }
-
-    Ok(())
 }
 
 /// Wait for a single keypress. Returns false on EOF or error (e.g. Ctrl-C).
@@ -137,7 +152,9 @@ mod tests {
 
         let result = run_reconnect_loop(
             || seq.connect(),
-            || { errors.fetch_add(1, Ordering::SeqCst); },
+            || {
+                errors.fetch_add(1, Ordering::SeqCst);
+            },
             || panic!("should not wait for keypress"),
             || false,
         );
@@ -169,14 +186,20 @@ mod tests {
 
         let result = run_reconnect_loop(
             || seq.connect(),
-            || { errors.fetch_add(1, Ordering::SeqCst); },
+            || {
+                errors.fetch_add(1, Ordering::SeqCst);
+            },
             || false, // user quits
             || false,
         );
 
         assert!(result.is_ok());
         assert_eq!(seq.calls(), 1);
-        assert_eq!(errors.load(Ordering::SeqCst), 0, "on_ssh_error must not fire for non-255 exits");
+        assert_eq!(
+            errors.load(Ordering::SeqCst),
+            0,
+            "on_ssh_error must not fire for non-255 exits"
+        );
     }
 
     #[test]
@@ -187,7 +210,9 @@ mod tests {
 
         let result = run_reconnect_loop(
             || seq.connect(),
-            || { errors.fetch_add(1, Ordering::SeqCst); },
+            || {
+                errors.fetch_add(1, Ordering::SeqCst);
+            },
             || panic!("immediate retry should succeed, no prompt needed"),
             || false,
         );
@@ -205,7 +230,9 @@ mod tests {
 
         let result = run_reconnect_loop(
             || seq.connect(),
-            || { errors.fetch_add(1, Ordering::SeqCst); },
+            || {
+                errors.fetch_add(1, Ordering::SeqCst);
+            },
             || false, // user quits
             || false,
         );
@@ -224,7 +251,9 @@ mod tests {
 
         let result = run_reconnect_loop(
             || seq.connect(),
-            || { errors.fetch_add(1, Ordering::SeqCst); },
+            || {
+                errors.fetch_add(1, Ordering::SeqCst);
+            },
             || true, // user keeps retrying
             || false,
         );
@@ -243,8 +272,13 @@ mod tests {
 
         let result = run_reconnect_loop(
             || seq.connect(),
-            || { errors.fetch_add(1, Ordering::SeqCst); },
-            || { waits.fetch_add(1, Ordering::SeqCst); true },
+            || {
+                errors.fetch_add(1, Ordering::SeqCst);
+            },
+            || {
+                waits.fetch_add(1, Ordering::SeqCst);
+                true
+            },
             || false,
         );
 
@@ -270,7 +304,9 @@ mod tests {
                 }
                 status
             },
-            || { errors.fetch_add(1, Ordering::SeqCst); },
+            || {
+                errors.fetch_add(1, Ordering::SeqCst);
+            },
             || panic!("signal should prevent prompt"),
             || closing.load(Ordering::SeqCst),
         );
@@ -301,14 +337,20 @@ mod tests {
 
         let result = run_reconnect_loop(
             || seq.connect(),
-            || { errors.fetch_add(1, Ordering::SeqCst); },
+            || {
+                errors.fetch_add(1, Ordering::SeqCst);
+            },
             || true,
             || false,
         );
 
         assert!(result.is_ok());
         assert_eq!(seq.calls(), 2);
-        assert_eq!(errors.load(Ordering::SeqCst), 0, "non-255 should never trigger on_ssh_error");
+        assert_eq!(
+            errors.load(Ordering::SeqCst),
+            0,
+            "non-255 should never trigger on_ssh_error"
+        );
     }
 
     // When B already established a healthy master, A's connect through it succeeds
@@ -320,13 +362,19 @@ mod tests {
 
         let result = run_reconnect_loop(
             || seq.connect(),
-            || { errors.fetch_add(1, Ordering::SeqCst); },
+            || {
+                errors.fetch_add(1, Ordering::SeqCst);
+            },
             || panic!("should not wait"),
             || false,
         );
 
         assert!(result.is_ok());
-        assert_eq!(errors.load(Ordering::SeqCst), 0, "must not kill another session's master");
+        assert_eq!(
+            errors.load(Ordering::SeqCst),
+            0,
+            "must not kill another session's master"
+        );
     }
 
     // Simulates: A connects, connection drops, master is stale. Reconnect kills
@@ -345,12 +393,17 @@ mod tests {
                     Ok(exit_status(0))
                 }
             },
-            || { master_alive.store(false, Ordering::SeqCst); },
+            || {
+                master_alive.store(false, Ordering::SeqCst);
+            },
             || panic!("immediate retry should succeed"),
             || false,
         );
 
         assert!(result.is_ok());
-        assert!(!master_alive.load(Ordering::SeqCst), "master should have been killed");
+        assert!(
+            !master_alive.load(Ordering::SeqCst),
+            "master should have been killed"
+        );
     }
 }
