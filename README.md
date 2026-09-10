@@ -13,6 +13,23 @@ sshr wraps SSH with:
 
 ## Install
 
+### Homebrew
+
+The repo doubles as a tap, so the formula can be installed straight from it:
+
+```bash
+brew install --HEAD https://raw.githubusercontent.com/DoeringChristian/sshr/main/Formula/sshr.rb
+```
+
+or, to track it as a tap and get `brew upgrade`:
+
+```bash
+brew tap doeringchristian/sshr https://github.com/DoeringChristian/sshr
+brew install --HEAD doeringchristian/sshr/sshr
+```
+
+Head-only — there is no tagged release yet. The formula installs the prebuilt shpool binaries and the kittens under `share/sshr/`, where sshr looks for them when uploading shpool to a remote.
+
 ### Nix
 
 ```bash
