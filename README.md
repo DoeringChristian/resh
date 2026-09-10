@@ -63,8 +63,8 @@ sshr myhost clean
 # Show sessions from all clients, not just this machine
 sshr -a myhost list
 
-# Force re-upload of shpool binary
-sshr --force-upload myhost
+# Replace the remote shpool binary (kills sessions, restarts the daemon; asks first)
+sshr --force-upgrade myhost
 
 # Verbose logging (SSH commands, paths)
 sshr -v myhost
@@ -89,7 +89,9 @@ sshr uses SSH `ControlMaster=auto` with `ControlPersist=10m` to multiplex all se
 
 **Reconnection**: when an SSH connection drops (exit code 255), sshr tears down the broken master, cleans up stale sockets, and immediately retries. If the retry also fails, it prompts you to press any key to try again. Non-SSH failures (e.g. a shpool crash) prompt without touching the master, since another session may be using it.
 
-**Session cleanup**: when sshr exits (normally or via SIGHUP/SIGTERM), it records the session in a write-ahead log and kills it on the remote. If the connection is already down, pending kills are replayed on the next connect to that host.
+**Session cleanup**: on a clean exit sshr kills its remote session directly. On SIGHUP/SIGTERM it cannot — closing a terminal window kills sshr along with the window, usually before it reaches any cleanup code — so the signal handler writes a write-ahead log entry and hands the kill to `sshr <host> kill <session>` in a session of its own (`fork` + `setsid`), which outlives the window and can build a fresh connection if the multiplexed one died with it. Whatever that process cannot finish stays in the WAL and is replayed on the next connect to that host.
+
+Sessions are killed one request at a time. shpool's daemon walks a multi-session kill in order and aborts the whole batch on the first session it cannot signal, so batching lets one unkillable session spare every session behind it.
 
 ## Configuration
 
@@ -186,7 +188,7 @@ map kitty_mod+x kitten smart_close.py
 
 **smart_launch** (`cmd+enter`) is context-aware: in an sshr window it opens a new sshr session to the same host in the same directory; in a local window it opens a local shell in the current directory.
 
-**smart_close** (`cmd+x`) closes the window. For sshr sessions, the closing signal triggers sshr's cleanup handler, which records the session in a write-ahead log and kills it on the remote (or on next connect if the connection is already down).
+**smart_close** (`cmd+x`) closes the window and nothing else — cleanup is sshr's job, and works the same in any terminal that hangs up its child. See **Session cleanup** above.
 
 ## Pre-built shpool Binaries
 
@@ -199,7 +201,19 @@ bash shpool/build.sh
 
 This builds a portable shpool binary and places it in `shpool/bin/`. On Linux, it produces a statically-linked musl binary.
 
-You can also set `SSHR_SHPOOL_DIR` to point to a custom directory containing the binaries.
+You can also set `SSHR_SHPOOL_DIR` to point to a custom directory containing the binaries. sshr otherwise looks for `shpool/bin/` (or `share/sshr/shpool/bin/`) by walking up from its own executable, so a binary installed outside such a tree needs this variable.
+
+**Upgrading an installed remote**: sshr only uploads when the remote has no shpool at all, so replacing an existing one takes `sshr --force-upgrade <host>`. It asks first, then kills every session on that host and stops the daemon, since the running daemon would otherwise hold the old binary open. The upload itself lands beside the target and is renamed over it, so anything still executing the old binary cannot block it.
+
+## Debugging
+
+Set `SSHR_LOG_FILE` to mirror sshr's verbose log to a file. Useful for the close path, which runs while the terminal is being torn down and has nowhere to print:
+
+```bash
+SSHR_LOG_FILE=~/sshr.log sshr myhost
+```
+
+The detached process that performs the remote kill logs there too, under its own pid.
 
 ## License
 

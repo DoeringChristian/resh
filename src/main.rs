@@ -43,9 +43,9 @@ struct Cli {
     #[arg(long)]
     shell: Option<String>,
 
-    /// Force upload of shpool binary even if already installed on remote
+    /// Replace the remote shpool binary: kills all sessions, restarts the daemon
     #[arg(long)]
-    force_upload: bool,
+    force_upgrade: bool,
 
     /// Verbose: log paths and SSH commands
     #[arg(short = 'v', long)]
@@ -98,11 +98,11 @@ fn ensure_remote_shpool(
     ssh: &SshContext,
     host: &str,
     extra_args: &[String],
-    force_upload: bool,
+    force_upgrade: bool,
     host_cfg: &HostConfig,
     paths: &RemotePaths,
 ) -> Result<()> {
-    upload::ensure_shpool(ssh, host, extra_args, force_upload, host_cfg, paths)
+    upload::ensure_shpool(ssh, host, extra_args, force_upgrade, host_cfg, paths)
 }
 
 fn cmd_list(host: &str, all: bool, host_cfg: &HostConfig) -> Result<()> {
@@ -134,7 +134,31 @@ fn cmd_kill(host: &str, sessions: &[String], all: bool, host_cfg: &HostConfig) -
         sessions.to_vec()
     };
 
-    session::kill_sessions(&ssh, host, &to_kill, &paths)
+    let outcomes = session::kill_each(&ssh, host, &to_kill, &paths);
+    let killed: Vec<String> = outcomes
+        .iter()
+        .filter(|(_, err)| err.is_none())
+        .map(|(name, _)| name.clone())
+        .collect();
+    // This command is also what a close signal hands the remote kill to, so it
+    // owns clearing the pending WAL entries for whatever it managed to kill.
+    if !killed.is_empty() {
+        wal::forget(host, &killed);
+    }
+
+    let failures: Vec<String> = outcomes
+        .into_iter()
+        .filter_map(|(name, err)| err.map(|e| format!("{name}: {e}")))
+        .collect();
+    if failures.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "failed to kill {} of {} session(s):\n  {}",
+        failures.len(),
+        to_kill.len(),
+        failures.join("\n  ")
+    );
 }
 
 fn cmd_clean(host: &str, all: bool, host_cfg: &HostConfig) -> Result<()> {
@@ -166,7 +190,7 @@ fn cmd_connect(
 
     ssh.clean_stale_master(host, ssh_args);
 
-    ensure_remote_shpool(&ssh, host, ssh_args, cli.force_upload, &host_cfg, &paths)?;
+    ensure_remote_shpool(&ssh, host, ssh_args, cli.force_upgrade, &host_cfg, &paths)?;
 
     wal::replay(&ssh, host, &paths);
 
@@ -205,7 +229,12 @@ fn cmd_connect(
         || ssh.clean_stale_master(host, ssh_args),
     )?;
 
+    vlog!(
+        "connect: session loop returned (code {code}, closing={}), starting cleanup",
+        signal::is_closing()
+    );
     wal::record_close(&ssh, host, &session_name, &paths);
+    vlog!("connect: cleanup finished");
 
     set_user_var("sshr_host", "");
     set_user_var("sshr_session", "");

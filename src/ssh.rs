@@ -9,6 +9,26 @@ pub struct SshContext {
     control_dir: PathBuf,
     control_path: String,
     ssh_cmd: String,
+    scp_cmd: String,
+}
+
+/// A remote command's result, including the exit status and stderr that
+/// `run_capture` throws away.
+pub struct RemoteOutput {
+    pub status: ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl RemoteOutput {
+    /// The most useful line of stderr for an error message, if any.
+    pub fn error_detail(&self) -> Option<String> {
+        self.stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+    }
 }
 
 impl SshContext {
@@ -21,6 +41,7 @@ impl SshContext {
             control_dir,
             control_path,
             ssh_cmd: "ssh".into(),
+            scp_cmd: "scp".into(),
         })
     }
 
@@ -33,6 +54,9 @@ impl SshContext {
             control_dir,
             control_path,
             ssh_cmd: ssh_cmd.into(),
+            // The same stand-in doubles as scp; tests inspect the arguments it
+            // was called with.
+            scp_cmd: ssh_cmd.into(),
         }
     }
 
@@ -108,8 +132,13 @@ impl SshContext {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
         let mut child = cmd.spawn().context("failed to execute ssh")?;
+        // Expose the child so a close signal can terminate it and let us run the
+        // direct remote-session kill immediately instead of deferring to the WAL.
+        crate::signal::set_ssh_child(child.id() as i32);
         nudge_terminal_size();
-        child.wait().context("failed to wait for ssh")
+        let status = child.wait().context("failed to wait for ssh");
+        crate::signal::set_ssh_child(0);
+        status
     }
 
     /// Run SSH and capture stdout, suppressing stderr.
@@ -119,6 +148,18 @@ impl SshContext {
         extra_args: &[String],
         remote_cmd: &str,
     ) -> Result<String> {
+        Ok(self.run_remote(host, extra_args, remote_cmd)?.stdout)
+    }
+
+    /// Run SSH and capture the remote command's full result. Callers that care
+    /// whether the remote command itself succeeded need this rather than
+    /// `run_capture`, which reports only ssh's own failures.
+    pub fn run_remote(
+        &self,
+        host: &str,
+        extra_args: &[String],
+        remote_cmd: &str,
+    ) -> Result<RemoteOutput> {
         let mut cmd = Command::new(&self.ssh_cmd);
         cmd.args(self.mux_args())
             .arg(host)
@@ -144,7 +185,11 @@ impl SshContext {
                 .to_string();
             anyhow::bail!("cannot connect to {host}: {detail}");
         }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(RemoteOutput {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
     }
 
     /// Upload a file via SCP using the same control socket.
@@ -157,19 +202,31 @@ impl SshContext {
     ) -> Result<()> {
         // SFTP-based scp (OpenSSH 9.0+) doesn't expand ~; use relative path
         let remote = remote.strip_prefix("~/").unwrap_or(remote);
-        let mut cmd = Command::new("scp");
+        let mut cmd = Command::new(&self.scp_cmd);
         cmd.arg("-o")
             .arg(format!("ControlPath={}", self.control_path))
             .args(translate_for_scp(extra_args))
             .arg(local)
             .arg(format!("{host}:{remote}"));
         vlog!("exec: {cmd:?}");
-        let status = cmd
+        let output = cmd
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stderr(Stdio::piped())
+            .output()
             .context("failed to execute scp")?;
-        anyhow::ensure!(status.success(), "scp upload failed");
+        if !output.status.success() {
+            // scp's own message is the only clue to why a copy failed (a full
+            // disk, a missing directory, ETXTBSY reported as "dest open ...:
+            // Failure"), so it has to reach the user.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("scp exited non-zero")
+                .trim();
+            anyhow::bail!("scp upload failed: {detail}");
+        }
         Ok(())
     }
 }
@@ -219,20 +276,22 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
+/// Test-only SSH stand-in: a shell script that logs the arguments it was
+/// called with and then behaves however the test asked it to.
 #[cfg(test)]
-mod tests {
+pub(crate) mod mock {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
-    struct MockSsh {
-        dir: PathBuf,
-        script_path: PathBuf,
+    pub(crate) struct MockSsh {
+        pub(crate) dir: PathBuf,
+        pub(crate) script_path: PathBuf,
     }
 
     impl MockSsh {
-        fn new(behavior: &str) -> Self {
+        pub(crate) fn new(behavior: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "sshr-test-{}-{}",
                 std::process::id(),
@@ -259,11 +318,11 @@ mod tests {
             Self { dir, script_path }
         }
 
-        fn path(&self) -> &str {
+        pub(crate) fn path(&self) -> &str {
             self.script_path.to_str().unwrap()
         }
 
-        fn calls(&self) -> Vec<String> {
+        pub(crate) fn calls(&self) -> Vec<String> {
             let log = self.dir.join("calls.log");
             if log.exists() {
                 fs::read_to_string(&log)
@@ -283,10 +342,16 @@ mod tests {
         }
     }
 
-    fn make_ctx(mock: &MockSsh) -> SshContext {
+    pub(crate) fn make_ctx(mock: &MockSsh) -> SshContext {
         let ctl_dir = mock.dir.join("ctl");
         SshContext::with_mock(mock.path(), ctl_dir.to_str().unwrap())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mock::{make_ctx, MockSsh};
+    use super::*;
 
     fn counting_script(mock: &MockSsh, fail_count: u32) {
         let script = format!(
@@ -336,7 +401,10 @@ mod tests {
 
         ctx.clean_stale_master("fermat", &[]);
 
-        assert!(!stale.exists(), "stale socket should be removed when master is dead");
+        assert!(
+            !stale.exists(),
+            "stale socket should be removed when master is dead"
+        );
     }
 
     #[test]
@@ -349,7 +417,29 @@ mod tests {
 
         ctx.clean_stale_master("fermat", &[]);
 
-        assert!(socket.exists(), "socket must not be removed when master is alive");
+        assert!(
+            socket.exists(),
+            "socket must not be removed when master is alive"
+        );
+    }
+
+    // ---- scp_upload ----
+
+    /// scp's own message is the only clue to why a copy failed; discarding it
+    /// turns "dest open …: Failure" (ETXTBSY) into an unactionable
+    /// "scp upload failed".
+    #[test]
+    fn scp_failure_reports_what_scp_said() {
+        let mock =
+            MockSsh::new("echo 'dest open \".local/share/sshr/bin/shpool\": Failure' >&2\nexit 1");
+        let ctx = make_ctx(&mock);
+
+        let err = ctx
+            .scp_upload("fermat", &[], std::path::Path::new("/tmp/x"), "bin/shpool")
+            .unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("dest open"), "got: {msg}");
     }
 
     // ---- run_capture ----

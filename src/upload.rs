@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
+use dialoguer::Confirm;
 use owo_colors::OwoColorize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::{EnvDirective, HostConfig};
 use crate::ssh::SshContext;
@@ -83,6 +84,11 @@ impl RemotePaths {
     pub fn socket(&self) -> String {
         format!(r#""$HOME/{REMOTE_SOCKET_DIR}/shpool.socket""#)
     }
+
+    /// Matches our daemon's command line for `pkill -f`.
+    pub fn daemon_pattern(&self) -> String {
+        format!(r#""$HOME/{REMOTE_SOCKET_DIR}/shpool.socket daemon""#)
+    }
 }
 
 fn escape_double_quoted(value: &str) -> String {
@@ -120,40 +126,36 @@ pub fn has_sshr_shpool(
     Ok(output.trim() == "yes")
 }
 
-/// Upload shpool binary to the remote. Returns true if successful.
+/// Locate the local shpool binary for the remote's platform.
+///
+/// Separate from the upload so callers can fail before doing anything
+/// irreversible: an upgrade kills sessions and stops the daemon, and neither
+/// may happen when there is nothing to install.
+fn resolve_local_binary(ssh: &SshContext, host: &str, extra_args: &[String]) -> Result<PathBuf> {
+    let platform = detect_remote_platform(ssh, host, extra_args)?;
+    let binary_name = platform.binary_name();
+    vlog!("remote platform: {}-{}", platform.os, platform.arch);
+
+    let shpool_dir =
+        find_shpool_dir().context("no local shpool binaries found (set SSHR_SHPOOL_DIR)")?;
+
+    let local_binary = shpool_dir.join(&binary_name);
+    anyhow::ensure!(
+        local_binary.exists(),
+        "no shpool binary for {binary_name} (expected {})",
+        local_binary.display()
+    );
+    Ok(local_binary)
+}
+
+/// Upload the given shpool binary to the remote.
 fn upload_shpool(
     ssh: &SshContext,
     host: &str,
     extra_args: &[String],
     paths: &RemotePaths,
-) -> Result<bool> {
-    let platform = detect_remote_platform(ssh, host, extra_args)?;
-    let binary_name = platform.binary_name();
-    vlog!("remote platform: {}-{}", platform.os, platform.arch);
-
-    let shpool_dir = match find_shpool_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            eprintln!(
-                "{}: no local shpool binaries found ({})",
-                "warning".yellow().bold(),
-                e
-            );
-            return Ok(false);
-        }
-    };
-
-    let local_binary = shpool_dir.join(&binary_name);
-    if !local_binary.exists() {
-        eprintln!(
-            "{}: no shpool binary for {} (expected {})",
-            "warning".yellow().bold(),
-            binary_name.dimmed(),
-            local_binary.display().to_string().dimmed(),
-        );
-        return Ok(false);
-    }
-
+    local_binary: &Path,
+) -> Result<()> {
     vlog!("upload: local binary = {}", local_binary.display());
     vlog!("upload: remote path = {}", paths.shpool());
     eprintln!("Uploading shpool to {}...", host.cyan().bold());
@@ -164,20 +166,87 @@ fn upload_shpool(
         &format!("mkdir -p {}", paths.shpool_dir()),
     )?;
 
+    // Upload beside the target, then rename over it: anything still executing
+    // the old binary (an attach client, or a daemon from an older layout) makes
+    // a direct write fail with ETXTBSY, while a rename only swaps the directory
+    // entry and leaves the running copy on its old inode.
     ssh.scp_upload(
         host,
         extra_args,
-        &local_binary,
-        &paths.scp_path("bin/shpool"),
+        local_binary,
+        &paths.scp_path("bin/shpool.new"),
     )?;
 
-    ssh.run_capture(host, extra_args, &format!("chmod +x {}", paths.shpool()))?;
+    ssh.run_capture(host, extra_args, &install_uploaded_cmd(paths))?;
 
     eprintln!("{}", "Done.".dimmed());
+    Ok(())
+}
+
+/// Put the freshly uploaded binary in place of the old one.
+fn install_uploaded_cmd(paths: &RemotePaths) -> String {
+    format!(
+        "chmod +x {new} && mv -f {new} {target}",
+        new = paths.home_path("bin/shpool.new"),
+        target = paths.shpool()
+    )
+}
+
+/// Stop our shpool daemon and clear its socket.
+///
+/// The running daemon keeps the binary open, and Linux refuses to write over a
+/// running executable, so an upgrade cannot replace it while the daemon lives.
+/// The pattern matches on the socket path so only this sshr's daemon is hit,
+/// not another shpool the user runs.
+fn stop_daemon_cmd(paths: &RemotePaths) -> String {
+    format!(
+        "pkill -f {} >/dev/null 2>&1; rm -f {}; true",
+        paths.daemon_pattern(),
+        paths.socket()
+    )
+}
+
+/// Kill every session on the host and stop the daemon, so the binary can be
+/// replaced. Returns false if the user declined.
+fn prepare_upgrade(
+    ssh: &SshContext,
+    host: &str,
+    extra_args: &[String],
+    paths: &RemotePaths,
+) -> Result<bool> {
+    let sessions = crate::session::list_sessions(ssh, host, extra_args, paths)?;
+
+    let confirmed = Confirm::new()
+        .with_prompt(format!(
+            "Upgrade shpool on {host}? Kills {} session(s) and restarts the daemon",
+            sessions.len()
+        ))
+        .default(false)
+        .interact()?;
+    if !confirmed {
+        return Ok(false);
+    }
+
+    let names: Vec<String> = sessions.into_iter().map(|s| s.name).collect();
+    if !names.is_empty() {
+        eprintln!("Killing {} session(s) on {}...", names.len(), host.cyan());
+        for (name, err) in crate::session::kill_each(ssh, host, &names, paths) {
+            if let Some(err) = err {
+                eprintln!(
+                    "{}: could not kill {name}: {err}",
+                    "warning".yellow().bold()
+                );
+            }
+        }
+    }
+
+    ssh.run_capture(host, extra_args, &stop_daemon_cmd(paths))?;
+    vlog!("shpool: daemon stopped for upgrade");
     Ok(true)
 }
 
-/// Ensure sshr's own shpool is on the remote. Upload if missing.
+/// Ensure sshr's own shpool is on the remote. Upload if missing, or replace it
+/// when `force` (`--force-upgrade`) and the user confirms.
 pub fn ensure_shpool(
     ssh: &SshContext,
     host: &str,
@@ -186,16 +255,28 @@ pub fn ensure_shpool(
     host_cfg: &HostConfig,
     paths: &RemotePaths,
 ) -> Result<()> {
-    if !force && has_sshr_shpool(ssh, host, extra_args, paths)? {
-        vlog!("shpool: present at {}", paths.shpool());
+    // Resolve the local binary before `prepare_upgrade`, which kills sessions
+    // and stops the daemon: failing after that would leave the host worse off
+    // than before with nothing installed in return.
+    let upgraded = if force {
+        let local = resolve_local_binary(ssh, host, extra_args)?;
+        if prepare_upgrade(ssh, host, extra_args, paths)? {
+            upload_shpool(ssh, host, extra_args, paths, &local)?;
+            true
+        } else {
+            false
+        }
     } else {
-        if force {
-            vlog!("shpool: forcing upload (--force-upload)");
+        false
+    };
+
+    if !upgraded {
+        if has_sshr_shpool(ssh, host, extra_args, paths)? {
+            vlog!("shpool: present at {}", paths.shpool());
         } else {
             vlog!("shpool: missing, uploading");
-        }
-        if !upload_shpool(ssh, host, extra_args, paths)? {
-            anyhow::bail!("failed to install shpool on remote");
+            let local = resolve_local_binary(ssh, host, extra_args)?;
+            upload_shpool(ssh, host, extra_args, paths, &local)?;
         }
     }
 
@@ -259,20 +340,20 @@ esac"#
 set +o posix
 unset ENV
 [ -f ~/.bashrc ] && . ~/.bashrc
-__sshr_uri_path() {{ printf %s "$1" | LC_ALL=C od -An -v -t x1 | awk '{{ for (i = 1; i <= NF; i++) {{ b = toupper($i); if (b == "2F") printf "/"; else printf "%%%s", b }} }}'; }}
+__sshr_uri_path() {{ printf %s "$1" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/#/%23/g' -e 's/?/%3F/g'; }}
 __sshr_osc7() {{ printf '\033]7;file://%s' "$(hostname)"; __sshr_uri_path "$PWD"; printf '\a'; }}
 PROMPT_COMMAND="${{PROMPT_COMMAND:+$PROMPT_COMMAND; }}__sshr_osc7"
 SSHR_EOF
 cat > {} << 'SSHR_EOF'
 ZDOTDIR="$HOME"
 [ -f "$ZDOTDIR/.zshenv" ] && . "$ZDOTDIR/.zshenv"
-__sshr_uri_path() {{ printf %s "$1" | LC_ALL=C od -An -v -t x1 | awk '{{ for (i = 1; i <= NF; i++) {{ b = toupper($i); if (b == "2F") printf "/"; else printf "%%%s", b }} }}'; }}
+__sshr_uri_path() {{ printf %s "$1" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/#/%23/g' -e 's/?/%3F/g'; }}
 __sshr_osc7() {{ printf '\033]7;file://%s' "$(hostname)"; __sshr_uri_path "$PWD"; printf '\a' }}
 precmd_functions+=(__sshr_osc7)
 SSHR_EOF
 cat > {} << 'SSHR_EOF'
 function __sshr_uri_path
-    printf %s "$argv[1]" | env LC_ALL=C od -An -v -t x1 | awk '{{ for (i = 1; i <= NF; i++) {{ b = toupper($i); if (b == "2F") printf "/"; else printf "%%%s", b }} }}'
+    printf %s "$argv[1]" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/#/%23/g' -e 's/?/%3F/g'
 end
 function __sshr_osc7 --on-event fish_prompt
     printf '\e]7;file://%s' (hostname)
@@ -378,6 +459,83 @@ mod tests {
         let paths = RemotePaths::new(None).unwrap();
         assert_eq!(paths.shpool(), r#""$HOME/.local/share/sshr/bin/shpool""#);
         assert_eq!(paths.socket(), r#""$HOME/.local/run/sshr/shpool.socket""#);
+    }
+
+    /// Anything still executing the old binary (an attach client, or a daemon
+    /// from an older layout on a different socket) makes writing over it fail
+    /// with ETXTBSY. Uploading beside it and renaming replaces the directory
+    /// entry while the running copy keeps the old inode.
+    #[test]
+    fn the_binary_is_replaced_by_rename_not_overwritten() {
+        let paths = RemotePaths::new(None).unwrap();
+        assert_eq!(
+            paths.scp_path("bin/shpool.new"),
+            ".local/share/sshr/bin/shpool.new"
+        );
+
+        let cmd = install_uploaded_cmd(&paths);
+        assert!(
+            cmd.contains(
+                r#"mv -f "$HOME/.local/share/sshr/bin/shpool.new" "$HOME/.local/share/sshr/bin/shpool""#
+            ),
+            "got: {cmd}"
+        );
+        assert!(cmd.contains("chmod +x"), "got: {cmd}");
+    }
+
+    /// An upgrade kills sessions and stops the daemon, which cannot be undone.
+    /// None of that may happen before we know there is a binary to install.
+    #[test]
+    fn an_upgrade_without_a_local_binary_touches_nothing_on_the_remote() {
+        let mock = crate::ssh::mock::MockSsh::new(
+            "case \"$*\" in\n\
+             *'list --json'*) echo '{\"sessions\":[]}';;\n\
+             *'uname -sm'*) echo 'Linux x86_64';;\n\
+             esac\nexit 0",
+        );
+        let ctx = crate::ssh::mock::make_ctx(&mock);
+        let empty = std::env::temp_dir().join(format!("sshr-nobin-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        std::env::set_var("SSHR_SHPOOL_DIR", &empty);
+
+        let err = ensure_shpool(
+            &ctx,
+            "fermat",
+            &[],
+            true,
+            &HostConfig::default(),
+            &RemotePaths::new(None).unwrap(),
+        )
+        .unwrap_err();
+
+        std::env::remove_var("SSHR_SHPOOL_DIR");
+        let _ = std::fs::remove_dir_all(&empty);
+        assert!(
+            !mock.calls().iter().any(|c| c.contains("pkill")),
+            "must not stop the daemon before knowing it can upload: {:?}",
+            mock.calls()
+        );
+        assert!(
+            format!("{err:#}").contains("no shpool binary for"),
+            "error should name the missing binary: {err:#}"
+        );
+    }
+
+    /// The daemon holds the binary open, and Linux refuses to overwrite a
+    /// running executable (ETXTBSY), so an upgrade has to stop it first. The
+    /// socket goes with it: a stale one makes the next attach dial a daemon
+    /// that is no longer there.
+    #[test]
+    fn stopping_the_daemon_matches_only_our_daemon_and_clears_the_socket() {
+        let cmd = stop_daemon_cmd(&RemotePaths::new(None).unwrap());
+        assert!(
+            cmd.contains(r#"pkill -f "$HOME/.local/run/sshr/shpool.socket daemon""#),
+            "got: {cmd}"
+        );
+        assert!(
+            cmd.contains(r#"rm -f "$HOME/.local/run/sshr/shpool.socket""#),
+            "got: {cmd}"
+        );
     }
 
     #[test]

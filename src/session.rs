@@ -188,20 +188,77 @@ pub fn kill_sessions(
     sessions: &[String],
     paths: &RemotePaths,
 ) -> Result<()> {
-    let session_list = sessions
-        .iter()
-        .map(|s| quote(s))
-        .collect::<Vec<_>>()
-        .join(" ");
-    // `--` terminates option parsing so a session name beginning with `-` is
-    // never treated as a flag, and each name is quoted as one shell word.
-    let cmd = format!(
-        "{} --socket {} kill -- {session_list}",
-        paths.shpool(),
-        paths.socket()
+    let failures: Vec<String> = kill_each(ssh, host, sessions, paths)
+        .into_iter()
+        .filter_map(|(name, err)| err.map(|e| format!("{name}: {e}")))
+        .collect();
+
+    if failures.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "failed to kill {} of {} session(s):\n  {}",
+        failures.len(),
+        sessions.len(),
+        failures.join("\n  ")
     );
-    ssh.run_capture(host, &[], &cmd)?;
-    Ok(())
+}
+
+/// Kill each session with its own request and report per-session outcomes.
+///
+/// One request per session on purpose: shpool's daemon walks a multi-session
+/// kill in order and aborts the whole batch on the first session it cannot
+/// signal, so a single unkillable session would otherwise spare every session
+/// listed behind it (shpool < 0.11.0 leaves such sessions behind whenever a
+/// shell dies without its entry being reaped).
+pub fn kill_each(
+    ssh: &SshContext,
+    host: &str,
+    sessions: &[String],
+    paths: &RemotePaths,
+) -> Vec<(String, Option<String>)> {
+    let mut outcomes = Vec::with_capacity(sessions.len());
+    let mut iter = sessions.iter();
+
+    for name in iter.by_ref() {
+        // `--` terminates option parsing so a session name beginning with
+        // `-` is never treated as a flag, and the name is one shell word.
+        let cmd = format!(
+            "{} --socket {} kill -- {}",
+            paths.shpool(),
+            paths.socket(),
+            quote(name)
+        );
+        match ssh.run_remote(host, &[], &cmd) {
+            // ssh itself failed (host down, auth, broken master). Every
+            // remaining session would fail the same way, so report them all
+            // rather than sitting through one connection timeout each.
+            Err(e) => {
+                let err = format!("{e:#}");
+                vlog!("session: kill {name} failed: {err}");
+                outcomes.push((name.clone(), Some(err.clone())));
+                outcomes.extend(iter.map(|rest| (rest.clone(), Some(err.clone()))));
+                break;
+            }
+            // shpool exits non-zero for a session it cannot find, but a
+            // session that is already gone is exactly what kill wants.
+            Ok(out) if !out.status.success() && !is_already_gone(&out.stderr) => {
+                let err = out
+                    .error_detail()
+                    .unwrap_or_else(|| format!("shpool kill exited with {}", out.status));
+                vlog!("session: kill {name} failed: {err}");
+                outcomes.push((name.clone(), Some(err)));
+            }
+            Ok(_) => outcomes.push((name.clone(), None)),
+        }
+    }
+
+    outcomes
+}
+
+/// `shpool kill` reports a missing session as `not found: <name>` on stderr.
+fn is_already_gone(stderr: &str) -> bool {
+    stderr.lines().any(|l| l.trim().starts_with("not found:"))
 }
 
 pub fn clean_detached(ssh: &SshContext, host: &str, all: bool, paths: &RemotePaths) -> Result<()> {
@@ -230,6 +287,117 @@ pub fn clean_detached(ssh: &SshContext, host: &str, all: bool, paths: &RemotePat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssh::mock::{make_ctx, MockSsh};
+
+    fn paths() -> RemotePaths {
+        RemotePaths::new(None).unwrap()
+    }
+
+    /// One dead session must not stop the others from being killed. shpool's
+    /// daemon aborts a whole multi-session kill on the first failure, so sshr
+    /// sends one session per request.
+    #[test]
+    fn kill_sends_one_request_per_session() {
+        let mock = MockSsh::new("exit 0");
+        let ctx = make_ctx(&mock);
+
+        kill_sessions(
+            &ctx,
+            "fermat",
+            &["alpha".into(), "beta".into(), "gamma".into()],
+            &paths(),
+        )
+        .unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(
+            calls.len(),
+            3,
+            "expected one ssh call per session: {calls:?}"
+        );
+        assert!(calls[0].contains("alpha") && !calls[0].contains("beta"));
+        assert!(calls[1].contains("beta"));
+        assert!(calls[2].contains("gamma"));
+    }
+
+    #[test]
+    fn kill_continues_after_a_session_fails() {
+        let mock = MockSsh::new("case \"$*\" in *beta*) echo 'boom' >&2; exit 1;; esac\nexit 0");
+        let ctx = make_ctx(&mock);
+
+        let err = kill_sessions(
+            &ctx,
+            "fermat",
+            &["alpha".into(), "beta".into(), "gamma".into()],
+            &paths(),
+        )
+        .unwrap_err();
+
+        let calls = mock.calls();
+        assert_eq!(
+            calls.len(),
+            3,
+            "a failure must not abort the rest: {calls:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("beta"), "error must name the session: {msg}");
+        assert!(
+            !msg.contains("alpha"),
+            "must not blame healthy sessions: {msg}"
+        );
+    }
+
+    /// shpool exits non-zero for a session it cannot find, but "already gone"
+    /// is the state kill is asking for. Treating it as a failure would keep
+    /// WAL entries for vanished sessions pending forever.
+    #[test]
+    fn kill_treats_an_already_gone_session_as_success() {
+        let mock = MockSsh::new("echo 'not found: alpha' >&2\nexit 1");
+        let ctx = make_ctx(&mock);
+
+        kill_sessions(&ctx, "fermat", &["alpha".into()], &paths()).unwrap();
+    }
+
+    /// A dead host fails identically for every session, so sshr must not sit
+    /// through one connection timeout per selected session.
+    #[test]
+    fn kill_stops_dialling_after_the_connection_fails() {
+        let mock = MockSsh::new(
+            "echo 'ssh: connect to host fermat port 22: No route to host' >&2\nexit 255",
+        );
+        let ctx = make_ctx(&mock);
+
+        let err = kill_sessions(
+            &ctx,
+            "fermat",
+            &["alpha".into(), "beta".into(), "gamma".into()],
+            &paths(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            mock.calls().len(),
+            1,
+            "must stop after the first connection failure"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("alpha") && msg.contains("beta") && msg.contains("gamma"));
+        assert!(msg.contains("No route to host"), "got: {msg}");
+    }
+
+    #[test]
+    fn kill_reports_remote_stderr() {
+        let mock = MockSsh::new("echo 'killing shell proc: ESRCH' >&2\nexit 1");
+        let ctx = make_ctx(&mock);
+
+        let err = kill_sessions(&ctx, "fermat", &["alpha".into()], &paths()).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ESRCH"),
+            "remote stderr must reach the user: {msg}"
+        );
+    }
 
     #[test]
     fn parses_json_list_with_status_and_timestamps() {

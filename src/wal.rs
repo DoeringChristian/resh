@@ -90,11 +90,48 @@ pub fn replay(ssh: &SshContext, host: &str, paths: &RemotePaths) {
         names.join(", ")
     );
 
-    if session::kill_sessions(ssh, host, &names, paths).is_ok() {
-        let remaining: Vec<WalEntry> = entries.into_iter().filter(|e| e.host != host).collect();
-        let _ = write_entries(&remaining);
-        vlog!("wal: flushed entries for {host}");
-    }
+    let outcomes = session::kill_each(ssh, host, &names, paths);
+    let remaining = remaining_after(entries, host, &outcomes);
+    let _ = write_entries(&remaining);
+    vlog!(
+        "wal: {} of {} close(s) for {host} still pending",
+        remaining.iter().filter(|e| e.host == host).count(),
+        names.len()
+    );
+}
+
+/// Drop the entries whose session was killed, keeping the ones that failed so
+/// a later connect retries them. Entries for other hosts are left untouched.
+fn remaining_after(
+    entries: Vec<WalEntry>,
+    host: &str,
+    outcomes: &[(String, Option<String>)],
+) -> Vec<WalEntry> {
+    entries
+        .into_iter()
+        .filter(|e| {
+            e.host != host
+                || !outcomes
+                    .iter()
+                    .any(|(name, err)| *name == e.session && err.is_none())
+        })
+        .collect()
+}
+
+/// Drop pending close entries for sessions that are now gone. Called by
+/// `sshr <host> kill`, which is both a user-facing command and the process the
+/// close signal hands the kill to.
+pub fn forget(host: &str, sessions: &[String]) {
+    let remaining = without_sessions(read_entries(), host, sessions);
+    let _ = write_entries(&remaining);
+    vlog!("wal: forgot {} session(s) for {host}", sessions.len());
+}
+
+fn without_sessions(entries: Vec<WalEntry>, host: &str, sessions: &[String]) -> Vec<WalEntry> {
+    entries
+        .into_iter()
+        .filter(|e| e.host != host || !sessions.contains(&e.session))
+        .collect()
 }
 
 fn remove_entry(host: &str, session_name: &str) {
@@ -116,4 +153,57 @@ fn data_dir() -> PathBuf {
                 .unwrap_or_else(|_| PathBuf::from("/tmp"))
                 .join(".local/share")
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(host: &str, session: &str) -> WalEntry {
+        WalEntry {
+            host: host.into(),
+            session: session.into(),
+        }
+    }
+
+    /// `sshr <host> kill <session>` is what the close signal hands the kill to,
+    /// so a successful kill has to clear the pending entry the signal handler
+    /// wrote — including the duplicate a second close signal may have added.
+    #[test]
+    fn forgetting_a_session_drops_all_its_entries_for_that_host_only() {
+        let entries = vec![
+            entry("fermat", "alpha"),
+            entry("fermat", "alpha"),
+            entry("fermat", "beta"),
+            entry("euler", "alpha"),
+        ];
+
+        let remaining = without_sessions(entries, "fermat", &["alpha".to_string()]);
+
+        let left: Vec<(&str, &str)> = remaining
+            .iter()
+            .map(|e| (e.host.as_str(), e.session.as_str()))
+            .collect();
+        assert_eq!(left, vec![("fermat", "beta"), ("euler", "alpha")]);
+    }
+
+    /// A session that could not be killed must stay pending, but it must not
+    /// hold back the entries that were killed successfully.
+    #[test]
+    fn only_the_sessions_that_failed_stay_pending() {
+        let entries = vec![
+            entry("fermat", "alpha"),
+            entry("fermat", "beta"),
+            entry("euler", "gamma"),
+        ];
+        let outcomes = vec![
+            ("alpha".to_string(), None),
+            ("beta".to_string(), Some("boom".to_string())),
+        ];
+
+        let remaining = remaining_after(entries, "fermat", &outcomes);
+
+        let names: Vec<&str> = remaining.iter().map(|e| e.session.as_str()).collect();
+        assert_eq!(names, vec!["beta", "gamma"]);
+    }
 }
