@@ -1,6 +1,6 @@
 """Kitty kitten: context-aware window launch.
 
-When the active window is an sshr remote session, launches a new sshr
+When the active window is an resh remote session, launches a new resh
 window to the same host in the same working directory. Otherwise falls
 back to launching a local window with cwd=current.
 """
@@ -25,21 +25,21 @@ def handle_result(args, answer, target_window_id, boss):
     if tab is None:
         return
 
-    sshr_host = window.user_vars.get("sshr_host", "")
+    resh_host = window.user_vars.get("resh_host", "")
 
-    if sshr_host:
+    if resh_host:
         remote_cwd = ""
         osc7_url = window.screen.last_reported_cwd
         if osc7_url:
             url = osc7_url.decode() if isinstance(osc7_url, bytes) else osc7_url
-            # sshr percent-encodes the path in the OSC 7 URL so spaces, '#', and
+            # resh percent-encodes the path in the OSC 7 URL so spaces, '#', and
             # '?' survive; decode it back before handing it to --remote-cwd.
             remote_cwd = unquote(urlparse(url).path)
 
-        cmd = ["sshr"]
+        cmd = ["resh"]
         if remote_cwd:
             cmd.extend(["--remote-cwd", remote_cwd])
-        cmd.append(sshr_host)
+        cmd.append(resh_host)
         tab.new_window(cmd=cmd)
     else:
         cwd = window.cwd_of_child

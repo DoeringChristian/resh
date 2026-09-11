@@ -8,7 +8,7 @@ use crate::upload::RemotePaths;
 use crate::vlog;
 
 pub fn wal_path() -> PathBuf {
-    data_dir().join("sshr").join("close.wal")
+    data_dir().join("resh").join("close.wal")
 }
 
 #[derive(Debug, Clone)]
@@ -119,7 +119,7 @@ fn remaining_after(
 }
 
 /// Drop pending close entries for sessions that are now gone. Called by
-/// `sshr <host> kill`, which is both a user-facing command and the process the
+/// `resh <host> kill`, which is both a user-facing command and the process the
 /// close signal hands the kill to.
 pub fn forget(host: &str, sessions: &[String]) {
     let remaining = without_sessions(read_entries(), host, sessions);
@@ -166,7 +166,7 @@ mod tests {
         }
     }
 
-    /// `sshr <host> kill <session>` is what the close signal hands the kill to,
+    /// `resh <host> kill <session>` is what the close signal hands the kill to,
     /// so a successful kill has to clear the pending entry the signal handler
     /// wrote — including the duplicate a second close signal may have added.
     #[test]

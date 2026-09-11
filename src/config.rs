@@ -271,11 +271,11 @@ fn merge_config(base: &mut HostConfig, overlay: &HostConfig) {
 
 fn config_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(dir).join("sshr/config.toml")
+        PathBuf::from(dir).join("resh/config.toml")
     } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".config/sshr/config.toml")
+        PathBuf::from(home).join(".config/resh/config.toml")
     } else {
-        PathBuf::from("~/.config/sshr/config.toml")
+        PathBuf::from("~/.config/resh/config.toml")
     }
 }
 
@@ -474,19 +474,19 @@ shell_integration = false
     fn test_remote_dir() {
         let cfg = parse(
             r#"
-remote_dir = ".local/share/custom-sshr"
+remote_dir = ".local/share/custom-resh"
 
 [hosts.server]
-remote_dir = "opt/sshr"
+remote_dir = "opt/resh"
 "#,
         );
         assert_eq!(
             cfg.for_host("other").remote_dir.as_deref(),
-            Some(".local/share/custom-sshr")
+            Some(".local/share/custom-resh")
         );
         assert_eq!(
             cfg.for_host("server").remote_dir.as_deref(),
-            Some("opt/sshr")
+            Some("opt/resh")
         );
     }
 

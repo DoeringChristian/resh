@@ -1,5 +1,5 @@
 [package]
-name = "sshr"
+name = "resh"
 version = "0.1.0"
 edition = "2021"
 description = "Resilient SSH sessions with automatic reconnection"

@@ -1,5 +1,5 @@
 {
-  description = "sshr - Resilient SSH sessions with automatic reconnection";
+  description = "resh - Resilient SSH sessions with automatic reconnection";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -15,17 +15,17 @@
       pkgs = import nixpkgs {inherit system;};
     in {
       packages.default = pkgs.rustPlatform.buildRustPackage {
-        pname = "sshr";
+        pname = "resh";
         version = "0.1.0";
         src = ./.;
         cargoHash = "sha256-kz/BAOnP+hj3gfXoTE7zNLORzqTC0+1iMTLIAXE750A=";
 
         postInstall = ''
-          mkdir -p $out/share/sshr/{kitty,shpool}
-          cp kitty/*.py $out/share/sshr/kitty/
-          cp shpool/build.sh $out/share/sshr/shpool/
+          mkdir -p $out/share/resh/{kitty,shpool}
+          cp kitty/*.py $out/share/resh/kitty/
+          cp shpool/build.sh $out/share/resh/shpool/
           if [ -d shpool/bin ]; then
-            cp -r shpool/bin $out/share/sshr/shpool/
+            cp -r shpool/bin $out/share/resh/shpool/
           fi
         '';
 
@@ -33,7 +33,7 @@
           description = "Resilient SSH sessions with automatic reconnection";
           license = licenses.mit;
           platforms = platforms.unix;
-          mainProgram = "sshr";
+          mainProgram = "resh";
         };
       };
 

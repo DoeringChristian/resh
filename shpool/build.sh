@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -eu
 
-# Build shpool from source for the current platform and store it in the sshr
+# Build shpool from source for the current platform and store it in the resh
 # bin directory. Run this on each target platform to populate the binary cache.
 #
 # On Linux, builds a statically-linked musl binary for maximum portability.

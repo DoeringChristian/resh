@@ -26,7 +26,7 @@ fn set_user_var(key: &str, value: &str) {
 
 #[derive(Parser)]
 #[command(
-    name = "sshr",
+    name = "resh",
     version,
     about = "Resilient SSH sessions with automatic reconnection"
 )]
@@ -186,7 +186,7 @@ fn cmd_connect(
     let ssh = SshContext::new()?;
     let paths = RemotePaths::new(host_cfg.remote_dir.as_deref())?;
 
-    set_user_var("sshr_host", host);
+    set_user_var("resh_host", host);
 
     ssh.clean_stale_master(host, ssh_args);
 
@@ -204,7 +204,7 @@ fn cmd_connect(
         session::new_session_name(&ssh, host, ssh_args, &paths)?
     };
 
-    set_user_var("sshr_session", &session_name);
+    set_user_var("resh_session", &session_name);
 
     let shell = cli.shell.clone().or(host_cfg.shell.clone());
     let remote_cwd = cli.remote_cwd.clone().or(host_cfg.cwd.clone());
@@ -236,9 +236,9 @@ fn cmd_connect(
     wal::record_close(&ssh, host, &session_name, &paths);
     vlog!("connect: cleanup finished");
 
-    set_user_var("sshr_host", "");
-    set_user_var("sshr_session", "");
+    set_user_var("resh_host", "");
+    set_user_var("resh_session", "");
 
-    // Propagate the remote shell's exit status as sshr's own.
+    // Propagate the remote shell's exit status as resh's own.
     std::process::exit(code);
 }

@@ -33,7 +33,7 @@ impl RemoteOutput {
 
 impl SshContext {
     pub fn new() -> Result<Self> {
-        let control_dir = dirs().join("sshr-sockets");
+        let control_dir = dirs().join("resh-sockets");
         fs::create_dir_all(&control_dir)
             .context("failed to create SSH control socket directory")?;
         let control_path = format!("{}/%r@%h:%p", control_dir.display());
@@ -293,7 +293,7 @@ pub(crate) mod mock {
     impl MockSsh {
         pub(crate) fn new(behavior: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "sshr-test-{}-{}",
+                "resh-test-{}-{}",
                 std::process::id(),
                 TEST_ID.fetch_add(1, Ordering::Relaxed),
             ));
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn scp_failure_reports_what_scp_said() {
         let mock =
-            MockSsh::new("echo 'dest open \".local/share/sshr/bin/shpool\": Failure' >&2\nexit 1");
+            MockSsh::new("echo 'dest open \".local/share/resh/bin/shpool\": Failure' >&2\nexit 1");
         let ctx = make_ctx(&mock);
 
         let err = ctx

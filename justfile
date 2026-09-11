@@ -5,7 +5,7 @@ shpool_ref := "v0.11.4"
 shpool_dir := "shpool/bin"
 shpool_patches := "shpool/patches"
 
-# Build sshr
+# Build resh
 build:
     cargo build --release
 
@@ -102,16 +102,16 @@ clean:
     cargo clean
     rm -f {{shpool_dir}}/shpool-*
 
-# Smoke-test sshr against an ephemeral Linux container (debian + sshd, no shpool, no fish)
+# Smoke-test resh against an ephemeral Linux container (debian + sshd, no shpool, no fish)
 smoke: build
     #!/usr/bin/env bash
     set -euo pipefail
-    name=sshr-smoke
+    name=resh-smoke
     port=2222
     platform=linux/amd64
     binary=shpool-linux-x86_64
 
-    rt=${SSHR_CONTAINER_RUNTIME:-}
+    rt=${RESH_CONTAINER_RUNTIME:-}
     if [ -z "$rt" ]; then
         if command -v docker >/dev/null 2>&1; then rt=docker
         elif command -v podman >/dev/null 2>&1; then rt=podman
@@ -127,7 +127,7 @@ smoke: build
     keydir=$(mktemp -d)
     cleanup() {
         rm -rf "$keydir"
-        rm -f "$HOME/.ssh/sshr-sockets/sshr@127.0.0.1:$port"
+        rm -f "$HOME/.ssh/resh-sockets/resh@127.0.0.1:$port"
         "$rt" rm -f "$name" >/dev/null 2>&1 || true
     }
     trap cleanup EXIT
@@ -142,17 +142,17 @@ smoke: build
     echo "==> starting container on 127.0.0.1:$port"
     "$rt" run -d --rm --platform "$platform" --name "$name" \
         -p "127.0.0.1:$port:22" "$name" >/dev/null
-    "$rt" cp "$keydir/id.pub" "$name:/home/sshr/.ssh/authorized_keys"
-    "$rt" exec "$name" chown sshr:sshr /home/sshr/.ssh/authorized_keys
-    "$rt" exec "$name" chmod 600 /home/sshr/.ssh/authorized_keys
+    "$rt" cp "$keydir/id.pub" "$name:/home/resh/.ssh/authorized_keys"
+    "$rt" exec "$name" chown resh:resh /home/resh/.ssh/authorized_keys
+    "$rt" exec "$name" chmod 600 /home/resh/.ssh/authorized_keys
 
     echo "==> waiting for sshd"
     for _ in $(seq 1 30); do
         ssh -q -i "$keydir/id" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -p "$port" sshr@127.0.0.1 true 2>/dev/null && break
+            -p "$port" resh@127.0.0.1 true 2>/dev/null && break
         sleep 0.5
     done
 
-    echo "==> launching sshr -v (exit shell to tear down)"
-    ./target/release/sshr -v sshr@127.0.0.1 \
+    echo "==> launching resh -v (exit shell to tear down)"
+    ./target/release/resh -v resh@127.0.0.1 \
         -i "$keydir/id" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port"

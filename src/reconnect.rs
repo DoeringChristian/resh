@@ -25,7 +25,7 @@ fn reset_terminal() {
 /// `on_ssh_error` is called when SSH itself fails (exit 255), e.g. to tear down
 /// a broken ControlMaster. It is NOT called when the remote command exits
 /// non-zero, since the SSH connection may still be healthy (another session's master).
-/// Returns the exit code sshr should propagate: 0 on a clean session exit, or
+/// Returns the exit code resh should propagate: 0 on a clean session exit, or
 /// the last remote/SSH failure code when the loop ends via shutdown or the user
 /// declining to reconnect.
 pub fn run_with_reconnect<F, B>(connect: F, on_ssh_error: B) -> Result<i32>

@@ -28,7 +28,7 @@ pub fn build_shpool_cmd(
 
 fn build_launch_command(paths: &RemotePaths, shell: Option<&str>) -> String {
     let mut command = format!(
-        "/bin/sh -c {} sshr-launch {}",
+        "/bin/sh -c {} resh-launch {}",
         quote(LAUNCH_COMMAND_SCRIPT),
         quote(&paths.launch_home_relative()),
     );
@@ -54,17 +54,17 @@ mod tests {
         let cmd = build_shpool_cmd(&paths, "s0", None, None);
         assert!(cmd.contains("attach -f -c "));
         assert!(cmd.contains("/bin/sh -c "));
-        assert!(cmd.contains("sshr-launch"));
-        assert!(cmd.contains(".local/share/sshr/init/launch.sh"));
+        assert!(cmd.contains("resh-launch"));
+        assert!(cmd.contains(".local/share/resh/init/launch.sh"));
         assert!(cmd.trim_end().ends_with("-- 's0'"));
         assert!(!cmd.contains(" -d "));
     }
 
     #[test]
     fn test_shell_override_with_cwd() {
-        let paths = RemotePaths::new(Some("custom/sshr")).unwrap();
+        let paths = RemotePaths::new(Some("custom/resh")).unwrap();
         let cmd = build_shpool_cmd(&paths, "s0", Some("/bin/zsh"), Some("~/projects"));
-        assert!(cmd.contains("custom/sshr/init/launch.sh"));
+        assert!(cmd.contains("custom/resh/init/launch.sh"));
         assert!(cmd.contains("'/bin/zsh'"));
         assert!(cmd.contains(r#"-d "$HOME"/'projects'"#));
         assert!(cmd.trim_end().ends_with("-- 's0'"));
@@ -76,11 +76,11 @@ mod tests {
     #[test]
     fn launch_command_resolves_home_and_execs_the_launcher() {
         let home = std::env::temp_dir().join(format!(
-            "sshr-cmd-test-{}-{}",
+            "resh-cmd-test-{}-{}",
             std::process::id(),
             TEST_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        let init = home.join(".local/share/sshr/init");
+        let init = home.join(".local/share/resh/init");
         fs::create_dir_all(&init).unwrap();
         let launcher = init.join("launch.sh");
         fs::write(

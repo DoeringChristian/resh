@@ -7,10 +7,10 @@ use crate::config::{EnvDirective, HostConfig};
 use crate::ssh::SshContext;
 use crate::vlog;
 
-const DEFAULT_REMOTE_DIR: &str = ".local/share/sshr";
-const REMOTE_SOCKET_DIR: &str = ".local/run/sshr";
+const DEFAULT_REMOTE_DIR: &str = ".local/share/resh";
+const REMOTE_SOCKET_DIR: &str = ".local/run/resh";
 
-/// Paths used by sshr on the remote host. Installed files can be relocated
+/// Paths used by resh on the remote host. Installed files can be relocated
 /// with `remote_dir`; runtime state deliberately remains under ~/.local/run.
 #[derive(Debug, Clone)]
 pub struct RemotePaths {
@@ -111,8 +111,8 @@ impl RemotePlatform {
     }
 }
 
-/// Check if sshr's own shpool already exists on the remote.
-pub fn has_sshr_shpool(
+/// Check if resh's own shpool already exists on the remote.
+pub fn has_resh_shpool(
     ssh: &SshContext,
     host: &str,
     extra_args: &[String],
@@ -137,7 +137,7 @@ fn resolve_local_binary(ssh: &SshContext, host: &str, extra_args: &[String]) -> 
     vlog!("remote platform: {}-{}", platform.os, platform.arch);
 
     let shpool_dir =
-        find_shpool_dir().context("no local shpool binaries found (set SSHR_SHPOOL_DIR)")?;
+        find_shpool_dir().context("no local shpool binaries found (set RESH_SHPOOL_DIR)")?;
 
     let local_binary = shpool_dir.join(&binary_name);
     anyhow::ensure!(
@@ -196,7 +196,7 @@ fn install_uploaded_cmd(paths: &RemotePaths) -> String {
 ///
 /// The running daemon keeps the binary open, and Linux refuses to write over a
 /// running executable, so an upgrade cannot replace it while the daemon lives.
-/// The pattern matches on the socket path so only this sshr's daemon is hit,
+/// The pattern matches on the socket path so only this resh's daemon is hit,
 /// not another shpool the user runs.
 fn stop_daemon_cmd(paths: &RemotePaths) -> String {
     format!(
@@ -245,7 +245,7 @@ fn prepare_upgrade(
     Ok(true)
 }
 
-/// Ensure sshr's own shpool is on the remote. Upload if missing, or replace it
+/// Ensure resh's own shpool is on the remote. Upload if missing, or replace it
 /// when `force` (`--force-upgrade`) and the user confirms.
 pub fn ensure_shpool(
     ssh: &SshContext,
@@ -271,7 +271,7 @@ pub fn ensure_shpool(
     };
 
     if !upgraded {
-        if has_sshr_shpool(ssh, host, extra_args, paths)? {
+        if has_resh_shpool(ssh, host, extra_args, paths)? {
             vlog!("shpool: present at {}", paths.shpool());
         } else {
             vlog!("shpool: missing, uploading");
@@ -336,35 +336,35 @@ esac"#
 
     let integration_files = if integration_enabled {
         format!(
-            r#"cat > {} << 'SSHR_EOF'
+            r#"cat > {} << 'RESH_EOF'
 set +o posix
 unset ENV
 [ -f ~/.bashrc ] && . ~/.bashrc
-__sshr_uri_path() {{ printf %s "$1" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/#/%23/g' -e 's/?/%3F/g'; }}
-__sshr_osc7() {{ printf '\033]7;file://%s' "$(hostname)"; __sshr_uri_path "$PWD"; printf '\a'; }}
-PROMPT_COMMAND="${{PROMPT_COMMAND:+$PROMPT_COMMAND; }}__sshr_osc7"
-SSHR_EOF
-cat > {} << 'SSHR_EOF'
+__resh_uri_path() {{ printf %s "$1" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/#/%23/g' -e 's/?/%3F/g'; }}
+__resh_osc7() {{ printf '\033]7;file://%s' "$(hostname)"; __resh_uri_path "$PWD"; printf '\a'; }}
+PROMPT_COMMAND="${{PROMPT_COMMAND:+$PROMPT_COMMAND; }}__resh_osc7"
+RESH_EOF
+cat > {} << 'RESH_EOF'
 ZDOTDIR="$HOME"
 [ -f "$ZDOTDIR/.zshenv" ] && . "$ZDOTDIR/.zshenv"
-__sshr_uri_path() {{ printf %s "$1" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/#/%23/g' -e 's/?/%3F/g'; }}
-__sshr_osc7() {{ printf '\033]7;file://%s' "$(hostname)"; __sshr_uri_path "$PWD"; printf '\a' }}
-precmd_functions+=(__sshr_osc7)
-SSHR_EOF
-cat > {} << 'SSHR_EOF'
-function __sshr_uri_path
+__resh_uri_path() {{ printf %s "$1" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/#/%23/g' -e 's/?/%3F/g'; }}
+__resh_osc7() {{ printf '\033]7;file://%s' "$(hostname)"; __resh_uri_path "$PWD"; printf '\a' }}
+precmd_functions+=(__resh_osc7)
+RESH_EOF
+cat > {} << 'RESH_EOF'
+function __resh_uri_path
     printf %s "$argv[1]" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/#/%23/g' -e 's/?/%3F/g'
 end
-function __sshr_osc7 --on-event fish_prompt
+function __resh_osc7 --on-event fish_prompt
     printf '\e]7;file://%s' (hostname)
-    __sshr_uri_path "$PWD"
+    __resh_uri_path "$PWD"
     printf '\a'
 end
-SSHR_EOF
+RESH_EOF
 "#,
             paths.home_path("init/bash_init.sh"),
             paths.home_path("init/zsh/.zshenv"),
-            paths.home_path("init/fish/vendor_conf.d/sshr.fish"),
+            paths.home_path("init/fish/vendor_conf.d/resh.fish"),
         )
     } else {
         String::new()
@@ -372,26 +372,26 @@ SSHR_EOF
 
     format!(
         r#"mkdir -p {} {} {}
-cat > {} << 'SSHR_EOF'
+cat > {} << 'RESH_EOF'
 #!/bin/sh
 # Re-exec through a login shell to inherit the full environment
 # (PATH from nix, homebrew, mise, etc.) — same as a normal SSH session.
-if [ -z "$_SSHR_LOGIN" ]; then
-    export _SSHR_LOGIN=1
+if [ -z "$_RESH_LOGIN" ]; then
+    export _RESH_LOGIN=1
     exec /bin/sh -l "$0" "$@"
 fi
-export SSH_CONNECTION="${{SSH_CONNECTION:-sshr}}"
+export SSH_CONNECTION="${{SSH_CONNECTION:-resh}}"
 {env_section}login_shell="${{1:-$SHELL}}"
 if [ "${{login_shell#/}}" = "$login_shell" ]; then
     login_shell=$(command -v "$login_shell" 2>/dev/null || echo "$login_shell")
 fi
 if ! command -v "$login_shell" >/dev/null 2>&1; then
-    echo "sshr: shell '$login_shell' not found, falling back to $SHELL" >&2
+    echo "resh: shell '$login_shell' not found, falling back to $SHELL" >&2
     login_shell="$SHELL"
 fi
 init_dir={}
 {launch_integration}
-SSHR_EOF
+RESH_EOF
 chmod +x {}
 {integration_files}"#,
         paths.init_dir(),
@@ -425,7 +425,7 @@ fn detect_remote_platform(
 }
 
 fn find_shpool_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("SSHR_SHPOOL_DIR") {
+    if let Ok(dir) = std::env::var("RESH_SHPOOL_DIR") {
         let path = PathBuf::from(dir);
         if path.is_dir() {
             return Ok(path);
@@ -440,7 +440,7 @@ fn find_shpool_dir() -> Result<PathBuf> {
         if repo_path.is_dir() {
             return Ok(repo_path);
         }
-        let nix_path = d.join("share/sshr/shpool/bin");
+        let nix_path = d.join("share/resh/shpool/bin");
         if nix_path.is_dir() {
             return Ok(nix_path);
         }
@@ -455,10 +455,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remote_paths_default_to_sshr_data_dir() {
+    fn remote_paths_default_to_resh_data_dir() {
         let paths = RemotePaths::new(None).unwrap();
-        assert_eq!(paths.shpool(), r#""$HOME/.local/share/sshr/bin/shpool""#);
-        assert_eq!(paths.socket(), r#""$HOME/.local/run/sshr/shpool.socket""#);
+        assert_eq!(paths.shpool(), r#""$HOME/.local/share/resh/bin/shpool""#);
+        assert_eq!(paths.socket(), r#""$HOME/.local/run/resh/shpool.socket""#);
     }
 
     /// Anything still executing the old binary (an attach client, or a daemon
@@ -470,13 +470,13 @@ mod tests {
         let paths = RemotePaths::new(None).unwrap();
         assert_eq!(
             paths.scp_path("bin/shpool.new"),
-            ".local/share/sshr/bin/shpool.new"
+            ".local/share/resh/bin/shpool.new"
         );
 
         let cmd = install_uploaded_cmd(&paths);
         assert!(
             cmd.contains(
-                r#"mv -f "$HOME/.local/share/sshr/bin/shpool.new" "$HOME/.local/share/sshr/bin/shpool""#
+                r#"mv -f "$HOME/.local/share/resh/bin/shpool.new" "$HOME/.local/share/resh/bin/shpool""#
             ),
             "got: {cmd}"
         );
@@ -494,9 +494,9 @@ mod tests {
              esac\nexit 0",
         );
         let ctx = crate::ssh::mock::make_ctx(&mock);
-        let empty = std::env::temp_dir().join(format!("sshr-nobin-{}", std::process::id()));
+        let empty = std::env::temp_dir().join(format!("resh-nobin-{}", std::process::id()));
         std::fs::create_dir_all(&empty).unwrap();
-        std::env::set_var("SSHR_SHPOOL_DIR", &empty);
+        std::env::set_var("RESH_SHPOOL_DIR", &empty);
 
         let err = ensure_shpool(
             &ctx,
@@ -508,7 +508,7 @@ mod tests {
         )
         .unwrap_err();
 
-        std::env::remove_var("SSHR_SHPOOL_DIR");
+        std::env::remove_var("RESH_SHPOOL_DIR");
         let _ = std::fs::remove_dir_all(&empty);
         assert!(
             !mock.calls().iter().any(|c| c.contains("pkill")),
@@ -529,19 +529,19 @@ mod tests {
     fn stopping_the_daemon_matches_only_our_daemon_and_clears_the_socket() {
         let cmd = stop_daemon_cmd(&RemotePaths::new(None).unwrap());
         assert!(
-            cmd.contains(r#"pkill -f "$HOME/.local/run/sshr/shpool.socket daemon""#),
+            cmd.contains(r#"pkill -f "$HOME/.local/run/resh/shpool.socket daemon""#),
             "got: {cmd}"
         );
         assert!(
-            cmd.contains(r#"rm -f "$HOME/.local/run/sshr/shpool.socket""#),
+            cmd.contains(r#"rm -f "$HOME/.local/run/resh/shpool.socket""#),
             "got: {cmd}"
         );
     }
 
     #[test]
     fn remote_paths_support_custom_home_relative_dir() {
-        let paths = RemotePaths::new(Some("~/opt/sshr")).unwrap();
-        assert_eq!(paths.launch(), r#""$HOME/opt/sshr/init/launch.sh""#);
+        let paths = RemotePaths::new(Some("~/opt/resh")).unwrap();
+        assert_eq!(paths.launch(), r#""$HOME/opt/resh/init/launch.sh""#);
         assert!(RemotePaths::new(Some("../outside-home")).is_err());
     }
 
@@ -549,24 +549,24 @@ mod tests {
     fn shell_integration_is_enabled_by_default() {
         let paths = RemotePaths::new(None).unwrap();
         let script = build_init_script(&HostConfig::default(), &paths);
-        assert!(script.contains("__sshr_osc7"));
+        assert!(script.contains("__resh_osc7"));
         assert!(script.contains("PROMPT_COMMAND="));
         assert!(script.contains("XDG_DATA_DIRS="));
     }
 
     #[test]
     fn shell_integration_can_be_disabled() {
-        let paths = RemotePaths::new(Some("custom/sshr")).unwrap();
+        let paths = RemotePaths::new(Some("custom/resh")).unwrap();
         let config = HostConfig {
             shell_integration: Some(false),
             ..HostConfig::default()
         };
         let script = build_init_script(&config, &paths);
 
-        assert!(!script.contains("__sshr_osc7"));
+        assert!(!script.contains("__resh_osc7"));
         assert!(!script.contains("PROMPT_COMMAND="));
         assert!(!script.contains("XDG_DATA_DIRS="));
-        assert!(script.contains(r#"init_dir="$HOME/custom/sshr/init""#));
+        assert!(script.contains(r#"init_dir="$HOME/custom/resh/init""#));
         assert!(script.contains(r#"exec "$login_shell""#));
     }
 }

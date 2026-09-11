@@ -65,7 +65,7 @@ pub struct SessionEntry {
 }
 
 impl SessionEntry {
-    /// One-line rendering for `sshr <host> list`.
+    /// One-line rendering for `resh <host> list`.
     pub fn display_line(&self) -> String {
         let started = self
             .started_at_unix_ms
@@ -294,7 +294,7 @@ mod tests {
     }
 
     /// One dead session must not stop the others from being killed. shpool's
-    /// daemon aborts a whole multi-session kill on the first failure, so sshr
+    /// daemon aborts a whole multi-session kill on the first failure, so resh
     /// sends one session per request.
     #[test]
     fn kill_sends_one_request_per_session() {
@@ -358,7 +358,7 @@ mod tests {
         kill_sessions(&ctx, "fermat", &["alpha".into()], &paths()).unwrap();
     }
 
-    /// A dead host fails identically for every session, so sshr must not sit
+    /// A dead host fails identically for every session, so resh must not sit
     /// through one connection timeout per selected session.
     #[test]
     fn kill_stops_dialling_after_the_connection_fails() {

@@ -22,7 +22,7 @@ struct WalContext {
     entry_line: Vec<u8>,
 }
 
-/// `sshr <host> kill <session>`, marshalled ahead of time so the handler can
+/// `resh <host> kill <session>`, marshalled ahead of time so the handler can
 /// exec it without allocating.
 struct KillCommand {
     exe: CString,
@@ -48,7 +48,7 @@ extern "C" fn handle_signal(signo: libc::c_int) {
     //
     // On a window close the kernel already SIGHUPs the whole foreground process
     // group, ssh included, so this is a no-op there. It matters for a bare
-    // `kill <pid>`, which reaches sshr alone and would otherwise leave ssh
+    // `kill <pid>`, which reaches resh alone and would otherwise leave ssh
     // running and wait() blocked until something SIGKILLs us. Forwarding the
     // signal we received rather than a substitute keeps the two paths honest.
     // Guarded by > 0 so it is a no-op when no child is running.
@@ -83,7 +83,7 @@ fn write_wal_entry() {
     }
 }
 
-/// Hand the remote kill to `sshr <host> kill <session>` in a session of its own.
+/// Hand the remote kill to `resh <host> kill <session>` in a session of its own.
 ///
 /// Closing a terminal window kills this process along with the window, usually
 /// before it can reach its own cleanup code — the WAL exists precisely because
@@ -128,7 +128,7 @@ pub fn set_ssh_child(pid: i32) {
 }
 
 pub fn install_handlers(host: &str, session_name: &str) {
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("sshr"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("resh"));
     install_handlers_with_exe(&exe, host, session_name);
 }
 
@@ -194,21 +194,21 @@ mod tests {
     use std::process::Command;
 
     // The signal is forwarded unchanged: ssh should die of the same signal that
-    // reached sshr, not of a substitute. Runs in an isolated subprocess for the
+    // reached resh, not of a substitute. Runs in an isolated subprocess for the
     // same reason as the test below.
     #[test]
     fn close_signal_is_forwarded_unchanged_to_the_ssh_child() {
         use std::os::unix::process::ExitStatusExt;
 
-        if std::env::var_os("SSHR_SIGNAL_FORWARD_TEST").is_none() {
-            let temp = std::env::temp_dir().join(format!("sshr-fwd-test-{}", std::process::id()));
+        if std::env::var_os("RESH_SIGNAL_FORWARD_TEST").is_none() {
+            let temp = std::env::temp_dir().join(format!("resh-fwd-test-{}", std::process::id()));
             let status = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "signal::tests::close_signal_is_forwarded_unchanged_to_the_ssh_child",
                     "--nocapture",
                 ])
-                .env("SSHR_SIGNAL_FORWARD_TEST", "1")
+                .env("RESH_SIGNAL_FORWARD_TEST", "1")
                 .env("XDG_DATA_HOME", &temp)
                 .status()
                 .unwrap();
@@ -231,19 +231,19 @@ mod tests {
         assert_eq!(
             status.signal(),
             Some(libc::SIGHUP),
-            "ssh child should receive the signal sshr received"
+            "ssh child should receive the signal resh received"
         );
         set_ssh_child(0);
     }
 
-    // The reason this exists: on a window close sshr is killed along with the
+    // The reason this exists: on a window close resh is killed along with the
     // window and never reaches its own cleanup code, so the kill has to be
-    // handed to a process outside the doomed process group while sshr is still
+    // handed to a process outside the doomed process group while resh is still
     // alive — which is only true inside the handler.
     #[test]
     fn close_signal_spawns_a_detached_killer_once() {
-        if std::env::var_os("SSHR_SIGNAL_SPAWN_TEST").is_none() {
-            let temp = std::env::temp_dir().join(format!("sshr-spawn-test-{}", std::process::id()));
+        if std::env::var_os("RESH_SIGNAL_SPAWN_TEST").is_none() {
+            let temp = std::env::temp_dir().join(format!("resh-spawn-test-{}", std::process::id()));
             std::fs::create_dir_all(&temp).unwrap();
             let status = Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -251,7 +251,7 @@ mod tests {
                     "signal::tests::close_signal_spawns_a_detached_killer_once",
                     "--nocapture",
                 ])
-                .env("SSHR_SIGNAL_SPAWN_TEST", &temp)
+                .env("RESH_SIGNAL_SPAWN_TEST", &temp)
                 .env("XDG_DATA_HOME", &temp)
                 .status()
                 .unwrap();
@@ -260,17 +260,17 @@ mod tests {
             return;
         }
 
-        let temp = PathBuf::from(std::env::var_os("SSHR_SIGNAL_SPAWN_TEST").unwrap());
+        let temp = PathBuf::from(std::env::var_os("RESH_SIGNAL_SPAWN_TEST").unwrap());
         let marker = temp.join("invocations");
-        let fake_sshr = temp.join("fake-sshr");
+        let fake_resh = temp.join("fake-resh");
         std::fs::write(
-            &fake_sshr,
+            &fake_resh,
             format!("#!/bin/sh\necho \"$@\" >> {}\n", marker.display()),
         )
         .unwrap();
-        std::fs::set_permissions(&fake_sshr, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&fake_resh, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        install_handlers_with_exe(&fake_sshr, "myhost", "mysession");
+        install_handlers_with_exe(&fake_resh, "myhost", "mysession");
 
         // Two signals: kitty sends one itself and the kernel sends another when
         // the pty closes. That must not produce two killers.
@@ -300,15 +300,15 @@ mod tests {
     // other tests.
     #[test]
     fn close_signal_terminates_the_registered_ssh_child() {
-        if std::env::var_os("SSHR_SIGNAL_CHILD_TEST").is_none() {
-            let temp = std::env::temp_dir().join(format!("sshr-sig-test-{}", std::process::id()));
+        if std::env::var_os("RESH_SIGNAL_CHILD_TEST").is_none() {
+            let temp = std::env::temp_dir().join(format!("resh-sig-test-{}", std::process::id()));
             let status = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "signal::tests::close_signal_terminates_the_registered_ssh_child",
                     "--nocapture",
                 ])
-                .env("SSHR_SIGNAL_CHILD_TEST", "1")
+                .env("RESH_SIGNAL_CHILD_TEST", "1")
                 .env("XDG_DATA_HOME", &temp)
                 .status()
                 .unwrap();

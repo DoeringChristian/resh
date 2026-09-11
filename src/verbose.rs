@@ -5,14 +5,14 @@ use std::sync::OnceLock;
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 
-/// Optional debug log, enabled by setting `SSHR_LOG_FILE`.
+/// Optional debug log, enabled by setting `RESH_LOG_FILE`.
 ///
 /// The close path (window close, signal handling, the remote kill that follows)
 /// runs while the terminal is being torn down, so anything written to stderr is
 /// lost. A file survives it.
 fn log_path() -> Option<&'static PathBuf> {
     static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-    PATH.get_or_init(|| std::env::var_os("SSHR_LOG_FILE").map(PathBuf::from))
+    PATH.get_or_init(|| std::env::var_os("RESH_LOG_FILE").map(PathBuf::from))
         .as_ref()
 }
 
@@ -51,7 +51,7 @@ macro_rules! vlog {
         $crate::verbose::log_line(&line);
         if $crate::verbose::enabled() {
             use ::owo_colors::OwoColorize;
-            eprintln!("{} {}", "sshr:".dimmed(), line);
+            eprintln!("{} {}", "resh:".dimmed(), line);
         }
     }};
 }
@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn log_lines_are_appended_with_the_pid() {
-        let path = std::env::temp_dir().join(format!("sshr-log-test-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("resh-log-test-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         log_line_to(&path, "first");
