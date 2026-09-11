@@ -1,0 +1,5 @@
+ref:      v0.11.4
+commit:   3a1020c74d1ac8eb191270922d834aa452cac816
+version:  0.11.4
+patches:  0001-treat-client-write-errors-as-hangup.patch
+built:    2026-09-11T19:17:52Z

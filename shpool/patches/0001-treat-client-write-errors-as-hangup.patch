@@ -1,0 +1,27 @@
+diff --git a/libshpool/src/daemon/shell.rs b/libshpool/src/daemon/shell.rs
+index ec841d2..2aa1835 100644
+--- a/libshpool/src/daemon/shell.rs
++++ b/libshpool/src/daemon/shell.rs
+@@ -432,9 +432,20 @@ impl SessionInner {
+                                     trace!("client hangup: {:?}", e);
+                                     false
+                                 }
++                                // Any write error means this client is gone, not that
++                                // the session is broken. This thread is spawned once per
++                                // session and never respawned, so killing it orphans a
++                                // live shell permanently: every later attach fails with
++                                // "sending on a disconnected channel" while the pty, the
++                                // shell and its children keep running, unreachable.
++                                //
++                                // A client that dies abruptly - machine sleep, a network
++                                // reset, a SIGKILL - closes its socket with data still
++                                // queued, which yields ECONNRESET rather than BrokenPipe.
++                                // That is an ordinary hangup, and is handled as one.
+                                 Err(e) => {
+-                                    error!("unexpected IO error while writing heartbeat: {}", e);
+-                                    return Err(e).context("writing heartbeat")?;
++                                    warn!("client write error, treating as hangup: {}", e);
++                                    false
+                                 }
+                             }
+                         } else {
