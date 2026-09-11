@@ -16,7 +16,7 @@
     in {
       packages.default = pkgs.rustPlatform.buildRustPackage {
         pname = "resh";
-        version = "0.1.0";
+        version = "0.2.0";
         src = ./.;
         cargoHash = "sha256-kz/BAOnP+hj3gfXoTE7zNLORzqTC0+1iMTLIAXE750A=";
 
