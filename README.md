@@ -194,18 +194,16 @@ DEPLOY_ENV = "production"
 
 ## Kitty Integration
 
-sshr works in any terminal, but ships optional kittens for kitty users. Copy `kitty/smart_launch.py` and `kitty/smart_close.py` to `~/.config/kitty/`, then add to `kitty.conf`:
+sshr works in any terminal, but ships an optional kitten for kitty users. Copy `kitty/smart_launch.py` to `~/.config/kitty/`, then add to `kitty.conf`:
 
 ```conf
 map cmd+enter kitten smart_launch.py
 map kitty_mod+enter kitten smart_launch.py
-map cmd+x kitten smart_close.py
-map kitty_mod+x kitten smart_close.py
 ```
 
 **smart_launch** (`cmd+enter`) is context-aware: in an sshr window it opens a new sshr session to the same host in the same directory; in a local window it opens a local shell in the current directory.
 
-**smart_close** (`cmd+x`) closes the window and nothing else — cleanup is sshr's job, and works the same in any terminal that hangs up its child. See **Session cleanup** above.
+Closing a window needs no kitten — kitty's built-in `close_window` (or `close_window_with_confirmation`) is enough, and so is any other way the window goes away. Cleanup hangs off the signal the terminal sends, not off the key you pressed; see **Session cleanup** above.
 
 ## Pre-built shpool Binaries
 
