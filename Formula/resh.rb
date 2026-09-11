@@ -1,9 +1,10 @@
 class Resh < Formula
   desc "Resilient SSH sessions with automatic reconnection"
   homepage "https://github.com/DoeringChristian/resh"
-  head "https://github.com/DoeringChristian/resh.git", branch: "main"
+  url "https://github.com/DoeringChristian/resh/archive/refs/tags/v0.2.0.tar.gz"
+  sha256 "b52c39c87348d301d38a16c6be657d59239a35bc089e8a3c80a9c22180498d59"
   license "MIT"
-  # no tagged release -> head-only; install with:  brew install --HEAD resh
+  head "https://github.com/DoeringChristian/resh.git", branch: "main"
   depends_on "rust" => :build
 
   def install

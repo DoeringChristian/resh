@@ -18,17 +18,17 @@ resh wraps SSH with:
 The repo doubles as a tap, so the formula can be installed straight from it:
 
 ```bash
-brew install --HEAD https://raw.githubusercontent.com/DoeringChristian/resh/main/Formula/resh.rb
+brew install https://raw.githubusercontent.com/DoeringChristian/resh/main/Formula/resh.rb
 ```
 
 or, to track it as a tap and get `brew upgrade`:
 
 ```bash
 brew tap doeringchristian/resh https://github.com/DoeringChristian/resh
-brew install --HEAD doeringchristian/resh/resh
+brew install doeringchristian/resh/resh
 ```
 
-Head-only — there is no tagged release yet. The formula installs the prebuilt shpool binaries and the kittens under `share/resh/`, where resh looks for them when uploading shpool to a remote.
+Add `--HEAD` to either command to track `main` instead of the latest release. The formula installs the prebuilt shpool binaries and the kittens under `share/resh/`, where resh looks for them when uploading shpool to a remote.
 
 ### Nix
 
