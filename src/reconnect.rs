@@ -3,6 +3,41 @@ use owo_colors::OwoColorize;
 use std::io::Read;
 use std::process::{Command, ExitStatus, Stdio};
 
+/// Escape sequences that put the terminal back to a sane state.
+///
+/// A full-screen program on the remote switches these modes on and switches
+/// them off when it exits. When the connection dies it never exits -- it is
+/// still running on the far side -- so nobody switches them off, and only the
+/// local side can. `stty sane` fixes the tty's line discipline; none of this
+/// is the line discipline.
+///
+/// The keyboard protocol is cleared twice because the main and alternate
+/// screens keep independent keyboard-mode stacks, so one clear only fixes
+/// whichever screen is current.
+fn reset_sequence() -> &'static str {
+    concat!(
+        "\x1b[=0;1u",  // kitty keyboard protocol: back to legacy keys (alt screen)
+        "\x1b[?1049l", // leave the alternate screen
+        "\x1b[=0;1u",  // and again for the main screen
+        "\x1b[!p",     // soft reset: cursor keys, keypad, origin, margins, charset
+        "\x1b[?25h",   // show the cursor
+        "\x1b[0m",     // drop colours and attributes
+        "\x1b[r",      // scroll region back to the whole screen
+        "\x1b(B",      // ASCII charset, not line drawing
+        "\x1b>",       // numeric keypad
+        "\x1b[?1l",    // normal cursor keys
+        "\x1b[?2026l", // synchronized output off, or the screen can stop updating
+        "\x1b[?2004l", // bracketed paste off
+        "\x1b[?1004l", // focus reporting off
+        "\x1b[?1006l", // SGR mouse off
+        "\x1b[?1015l", // urxvt mouse off
+        "\x1b[?1005l", // utf8 mouse off
+        "\x1b[?1003l", // any-event mouse tracking off
+        "\x1b[?1002l", // button-event mouse tracking off
+        "\x1b[?1000l", // normal mouse tracking off
+    )
+}
+
 fn reset_terminal() {
     let _ = Command::new("stty")
         .arg("sane")
@@ -10,15 +45,7 @@ fn reset_terminal() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    eprint!(concat!(
-        "\x1b[?1049l", // exit alternate screen
-        "\x1b[?1006l", // disable SGR mouse mode
-        "\x1b[?1004l", // disable focus reporting
-        "\x1b[?1003l", // disable any-event mouse tracking
-        "\x1b[?1002l", // disable button-event mouse tracking
-        "\x1b[?1000l", // disable normal mouse tracking
-        "\x1b[?2004l", // disable bracketed paste
-    ));
+    eprint!("{}", reset_sequence());
 }
 
 /// Run a connection function in a loop, prompting to reconnect on failure.
@@ -54,7 +81,9 @@ where
     C: Fn() -> bool,
 {
     let mut last_failure = 1;
+    let mut attempt: u32 = 0;
     loop {
+        attempt += 1;
         let mut status = connect()?;
         reset_terminal();
 
@@ -82,16 +111,20 @@ where
         // 255 is SSH's own exit code; anything else came from the remote
         // command, meaning the connection itself is fine.
         let reason = match status.code() {
-            Some(255) => "Connection lost.".to_string(),
-            Some(code) => format!("Remote command failed (exit {code})."),
-            None => "Connection killed by signal.".to_string(),
+            Some(255) => "Connection lost".to_string(),
+            Some(code) => format!("Remote command failed (exit {code})"),
+            None => "Connection killed by signal".to_string(),
         };
         eprintln!();
         eprintln!(
             "{}",
-            format!("{reason} Press any key to reconnect (Ctrl-C to quit)...")
+            format!("{reason}, attempt {attempt} of reconnecting failed.")
                 .yellow()
                 .bold()
+        );
+        eprintln!(
+            "{}",
+            "Press any key to retry, Ctrl-C to quit.".yellow().bold()
         );
 
         if !wait() {
@@ -103,14 +136,92 @@ where
 }
 
 /// Wait for a single keypress. Returns false on EOF or error (e.g. Ctrl-C).
+///
+/// Reads in raw mode for two reasons. `reset_terminal` has just run `stty
+/// sane`, which restores canonical mode and echo -- so a cooked read would not
+/// return until Enter, making "press any key" a lie, and every key pressed
+/// before that would be echoed to the screen. With a remote TUI's keyboard
+/// mode still in effect those echoes are escape sequences like `^[[106;9:3u`.
+///
+/// The input queue is flushed afterwards: one keypress can produce several
+/// bytes, and the remainder would otherwise be delivered to the reconnected
+/// session as if typed.
 fn wait_for_keypress() -> bool {
+    let fd = libc::STDIN_FILENO;
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    let is_tty = unsafe { libc::tcgetattr(fd, &mut saved) } == 0;
+
+    if is_tty {
+        let mut raw = saved;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) };
+    }
+
     let mut buf = [0u8; 1];
-    matches!(std::io::stdin().read(&mut buf), Ok(1..))
+    let got = std::io::stdin().read(&mut buf);
+
+    if is_tty {
+        unsafe {
+            libc::tcflush(fd, libc::TCIFLUSH);
+            libc::tcsetattr(fd, libc::TCSANOW, &saved);
+        }
+    }
+
+    matches!(got, Ok(1..))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A TUI that dies with the connection never gets to switch these back off
+    /// -- it is still running on the far side of a dead wire. Until the local
+    /// side clears them, keys arrive as `^[[106;9:3u`, the cursor can be
+    /// invisible, colours stick, and output is confined to a stale scroll
+    /// region.
+    #[test]
+    fn terminal_reset_clears_what_a_dead_tui_leaves_behind() {
+        let seq = reset_sequence();
+
+        for (what, code) in [
+            ("kitty keyboard protocol", "\x1b[=0;1u"),
+            ("alternate screen", "\x1b[?1049l"),
+            ("cursor visibility", "\x1b[?25h"),
+            ("text attributes", "\x1b[0m"),
+            ("scroll region", "\x1b[r"),
+            ("ASCII charset", "\x1b(B"),
+            ("numeric keypad", "\x1b>"),
+            ("application cursor keys", "\x1b[?1l"),
+            ("synchronized output", "\x1b[?2026l"),
+            ("bracketed paste", "\x1b[?2004l"),
+            ("focus reporting", "\x1b[?1004l"),
+        ] {
+            assert!(seq.contains(code), "reset must clear {what} ({code:?})");
+        }
+    }
+
+    /// The two screens keep independent keyboard-mode stacks, so clearing it
+    /// once only fixes whichever screen happens to be current.
+    #[test]
+    fn keyboard_protocol_is_cleared_on_both_screens() {
+        let seq = reset_sequence();
+        let alt_exit = seq
+            .find("\x1b[?1049l")
+            .expect("leaves the alternate screen");
+        let first = seq
+            .find("\x1b[=0;1u")
+            .expect("clears the keyboard protocol");
+        let last = seq.rfind("\x1b[=0;1u").unwrap();
+
+        assert!(
+            first < alt_exit,
+            "must clear it before leaving the alt screen"
+        );
+        assert!(last > alt_exit, "and again after, for the main screen");
+    }
+
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn exit_status(code: i32) -> ExitStatus {

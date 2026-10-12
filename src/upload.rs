@@ -334,6 +334,21 @@ esac"#
         r#"exec "$login_shell""#
     };
 
+    // shpool repaints a screenful of remembered scrollback on reattach by
+    // default ("screen" mode). In a window that still shows that content it
+    // arrives as a second copy, which is what leaves full-screen apps with
+    // blank lines and their view offset. "simple" restores nothing and only
+    // sends SIGWINCH, so the app repaints itself.
+    //
+    // Written before the first attach, so the daemon that attach spawns picks
+    // it up at startup -- its config watcher cannot see a file that does not
+    // exist yet. Never written over an existing config: that one is the
+    // user's, and shpool has plenty of other settings.
+    let shpool_config = r#"[ -f "$HOME/.config/shpool/config.toml" ] || {
+mkdir -p "$HOME/.config/shpool"
+printf 'session_restore_mode = "simple"\n' > "$HOME/.config/shpool/config.toml"
+}"#;
+
     let integration_files = if integration_enabled {
         format!(
             r#"cat > {} << 'RESH_EOF'
@@ -393,7 +408,8 @@ init_dir={}
 {launch_integration}
 RESH_EOF
 chmod +x {}
-{integration_files}"#,
+{integration_files}
+{shpool_config}"#,
         paths.init_dir(),
         paths.home_path("init/zsh"),
         paths.home_path("init/fish/vendor_conf.d"),
@@ -459,6 +475,29 @@ mod tests {
         let paths = RemotePaths::new(None).unwrap();
         assert_eq!(paths.shpool(), r#""$HOME/.local/share/resh/bin/shpool""#);
         assert_eq!(paths.socket(), r#""$HOME/.local/run/resh/shpool.socket""#);
+    }
+
+    /// shpool's default restore mode repaints a screenful of remembered
+    /// scrollback on every reattach. In the same window that already shows
+    /// that content it lands as a second copy, which is what leaves nvim with
+    /// blank lines and its view offset from the bottom. "simple" restores
+    /// nothing and only sends SIGWINCH, so the app repaints itself.
+    ///
+    /// Written before the first attach so the daemon that attach spawns reads
+    /// it at startup, and never over an existing file -- that one is the
+    /// user's.
+    #[test]
+    fn init_script_installs_a_shpool_config_without_overwriting_one() {
+        let script = build_init_script(&HostConfig::default(), &RemotePaths::new(None).unwrap());
+
+        assert!(
+            script.contains(r#"session_restore_mode = "simple""#),
+            "init script should set the restore mode: {script}"
+        );
+        assert!(
+            script.contains(r#"[ -f "$HOME/.config/shpool/config.toml" ]"#),
+            "must be guarded so an existing config is left alone: {script}"
+        );
     }
 
     /// Anything still executing the old binary (an attach client, or a daemon
