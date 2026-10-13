@@ -396,6 +396,12 @@ if [ -z "$_RESH_LOGIN" ]; then
     exec /bin/sh -l "$0" "$@"
 fi
 export SSH_CONNECTION="${{SSH_CONNECTION:-resh}}"
+# shpool daemonizes with an empty umask and never restores it, so every shell
+# it forks would create world-writable files. Only that inherited zero is
+# corrected -- a umask set deliberately by a profile is left alone.
+case "$(umask)" in
+    0|000|0000) umask 022 ;;
+esac
 {env_section}login_shell="${{1:-$SHELL}}"
 if [ "${{login_shell#/}}" = "$login_shell" ]; then
     login_shell=$(command -v "$login_shell" 2>/dev/null || echo "$login_shell")
@@ -475,6 +481,25 @@ mod tests {
         let paths = RemotePaths::new(None).unwrap();
         assert_eq!(paths.shpool(), r#""$HOME/.local/share/resh/bin/shpool""#);
         assert_eq!(paths.socket(), r#""$HOME/.local/run/resh/shpool.socket""#);
+    }
+
+    /// shpool daemonizes with an empty umask (daemonize.rs: `umask(Mode::empty())`)
+    /// and never restores it, so every shell it forks would create
+    /// world-writable files. Corrected in the launcher, which runs for every
+    /// session resh starts -- and only when the umask is still that inherited
+    /// zero, so a umask the user's profile sets deliberately is left alone.
+    #[test]
+    fn launcher_corrects_the_umask_the_daemon_leaks() {
+        let script = build_init_script(&HostConfig::default(), &RemotePaths::new(None).unwrap());
+
+        assert!(
+            script.contains("umask 022"),
+            "launcher must fix the umask: {script}"
+        );
+        assert!(
+            script.contains("case \"$(umask)\" in"),
+            "only the leaked zero umask should be corrected: {script}"
+        );
     }
 
     /// shpool's default restore mode repaints a screenful of remembered
