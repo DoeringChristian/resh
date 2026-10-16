@@ -14,18 +14,25 @@ use std::process::{Command, ExitStatus, Stdio};
 /// The keyboard protocol is cleared twice because the main and alternate
 /// screens keep independent keyboard-mode stacks, so one clear only fixes
 /// whichever screen is current.
+///
+/// Every mode is named individually rather than swept up by a soft reset
+/// (`\x1b[!p`), because kitty forgets the directory the remote shell reported
+/// with OSC 7 when it sees one -- see `reset_keeps_the_cwd_the_shell_reported`.
 fn reset_sequence() -> &'static str {
     concat!(
         "\x1b[=0;1u",  // kitty keyboard protocol: back to legacy keys (alt screen)
         "\x1b[?1049l", // leave the alternate screen
         "\x1b[=0;1u",  // and again for the main screen
-        "\x1b[!p",     // soft reset: cursor keys, keypad, origin, margins, charset
         "\x1b[?25h",   // show the cursor
         "\x1b[0m",     // drop colours and attributes
         "\x1b[r",      // scroll region back to the whole screen
         "\x1b(B",      // ASCII charset, not line drawing
         "\x1b>",       // numeric keypad
         "\x1b[?1l",    // normal cursor keys
+        "\x1b[4l",     // replace mode, not insert
+        "\x1b[?6l",    // origin at the screen, not the scroll region
+        "\x1b[?7h",    // wrap long lines again
+        "\x1b[2l",     // unlock the keyboard
         "\x1b[?2026l", // synchronized output off, or the screen can stop updating
         "\x1b[?2004l", // bracketed paste off
         "\x1b[?1004l", // focus reporting off
@@ -199,6 +206,36 @@ mod tests {
             ("focus reporting", "\x1b[?1004l"),
         ] {
             assert!(seq.contains(code), "reset must clear {what} ({code:?})");
+        }
+    }
+
+    /// A soft reset would be the obvious way to ask for most of the above at
+    /// once, and resh used to. But kitty forgets the working directory the
+    /// remote shell reported with OSC 7 when it sees one (verified on 0.49.2:
+    /// `\x1b[!p` empties `screen.last_reported_cwd`), and a session sitting in
+    /// a full-screen program never prints another prompt to report it again.
+    /// The window is then stuck knowing its host but not its directory, and a
+    /// launcher spawning its next sibling can only open the remote's home.
+    /// So the reset spells out what it wants instead of asking wholesale.
+    #[test]
+    fn reset_keeps_the_cwd_the_shell_reported() {
+        let seq = reset_sequence();
+
+        assert!(
+            !seq.contains("\x1b[!p"),
+            "a soft reset drops kitty's record of the remote cwd: {seq:?}"
+        );
+
+        for (what, code) in [
+            ("insert/replace mode", "\x1b[4l"),
+            ("origin mode", "\x1b[?6l"),
+            ("autowrap", "\x1b[?7h"),
+            ("keyboard action mode", "\x1b[2l"),
+        ] {
+            assert!(
+                seq.contains(code),
+                "dropping the soft reset means clearing {what} explicitly ({code:?})"
+            );
         }
     }
 
