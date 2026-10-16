@@ -182,6 +182,39 @@ fn install_handlers_with_exe(exe: &Path, host: &str, session_name: &str) {
     }
 }
 
+/// Withdraw the terminal's user variables on SIGINT, then die as before.
+///
+/// "Ctrl-C to quit" at the reconnect prompt is a documented way out, and a
+/// signal bypasses every destructor -- which would leave the window claiming a
+/// host that nothing is connected to, and send the next launch from that window
+/// to the remote. `write` is async-signal-safe and the sequence is
+/// pre-rendered, so the handler neither allocates nor formats.
+extern "C" fn handle_interrupt(signo: libc::c_int) {
+    let seq = crate::uservar::WITHDRAW_BOTH;
+    unsafe {
+        libc::write(
+            libc::STDERR_FILENO,
+            seq.as_ptr() as *const libc::c_void,
+            seq.len(),
+        );
+        // Hand the signal back to the default action instead of exiting here,
+        // so resh still dies of SIGINT and nothing else about Ctrl-C changes.
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::raise(signo);
+    }
+}
+
+/// Install the SIGINT handler. Separate from `install_handlers` because this is
+/// not the close path: Ctrl-C leaves the remote session running, by design.
+pub fn install_interrupt_handler() {
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_interrupt as *const () as libc::sighandler_t,
+        );
+    }
+}
+
 pub fn is_closing() -> bool {
     CLOSING.load(Ordering::SeqCst)
 }
@@ -291,6 +324,44 @@ mod tests {
         let content = std::fs::read_to_string(&marker).unwrap_or_default();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines, vec!["myhost kill mysession"], "got: {content:?}");
+    }
+
+    // Ctrl-C at the reconnect prompt kills resh without running a destructor.
+    // If the terminal's user variables survive that, the window goes on
+    // claiming a host, and the next window launched from it is connected to the
+    // remote -- with the local working directory -- from a window that is local.
+    #[test]
+    fn interrupt_withdraws_the_terminal_user_variables() {
+        use std::os::unix::process::ExitStatusExt;
+
+        if std::env::var_os("RESH_INTERRUPT_TEST").is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "signal::tests::interrupt_withdraws_the_terminal_user_variables",
+                    "--nocapture",
+                ])
+                .env("RESH_INTERRUPT_TEST", "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(crate::uservar::WITHDRAW_BOTH),
+                "an interrupted resh must withdraw both variables; stderr was {stderr:?}"
+            );
+            assert_eq!(
+                out.status.signal(),
+                Some(libc::SIGINT),
+                "and must still die of SIGINT"
+            );
+            return;
+        }
+
+        install_interrupt_handler();
+        unsafe {
+            libc::raise(libc::SIGINT);
+        }
+        unreachable!("SIGINT should have terminated this process");
     }
 
     // Verifies the missing link that used to defer cleanup: on a close signal

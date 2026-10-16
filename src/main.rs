@@ -7,22 +7,17 @@ mod session;
 mod signal;
 mod ssh;
 mod upload;
+mod uservar;
 mod verbose;
 mod wal;
 
 use anyhow::Result;
-use base64::Engine;
 use clap::Parser;
 use owo_colors::OwoColorize;
 
 use config::HostConfig;
 use ssh::SshContext;
 use upload::RemotePaths;
-
-fn set_user_var(key: &str, value: &str) {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(value);
-    eprint!("\x1b]1337;SetUserVar={key}={encoded}\x07");
-}
 
 #[derive(Parser)]
 #[command(
@@ -186,8 +181,6 @@ fn cmd_connect(
     let ssh = SshContext::new()?;
     let paths = RemotePaths::new(host_cfg.remote_dir.as_deref())?;
 
-    set_user_var("resh_host", host);
-
     ssh.clean_stale_master(host, ssh_args);
 
     ensure_remote_shpool(&ssh, host, ssh_args, cli.force_upgrade, &host_cfg, &paths)?;
@@ -204,7 +197,11 @@ fn cmd_connect(
         session::new_session_name(&ssh, host, ssh_args, &paths)?
     };
 
-    set_user_var("resh_session", &session_name);
+    // Published only now that there is a session to publish. These variables
+    // live on the terminal window, which outlives resh, so a window left
+    // claiming a host it never reached is what makes the next launch from it
+    // connect to that host -- from a local window, with a local cwd.
+    let session_vars = uservar::SessionVars::announce(host, &session_name);
 
     let shell = cli.shell.clone().or(host_cfg.shell.clone());
     let remote_cwd = cli.remote_cwd.clone().or(host_cfg.cwd.clone());
@@ -217,6 +214,7 @@ fn cmd_connect(
     );
 
     signal::install_handlers(host, &session_name);
+    signal::install_interrupt_handler();
 
     eprintln!(
         "Connecting to {} (session: {})...",
@@ -236,8 +234,8 @@ fn cmd_connect(
     wal::record_close(&ssh, host, &session_name, &paths);
     vlog!("connect: cleanup finished");
 
-    set_user_var("resh_host", "");
-    set_user_var("resh_session", "");
+    // Withdrawn explicitly because `exit` runs no destructors.
+    drop(session_vars);
 
     // Propagate the remote shell's exit status as resh's own.
     std::process::exit(code);
