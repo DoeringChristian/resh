@@ -1,8 +1,8 @@
 class Resh < Formula
   desc "Resilient SSH sessions with automatic reconnection"
   homepage "https://github.com/DoeringChristian/resh"
-  url "https://github.com/DoeringChristian/resh/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "b52c39c87348d301d38a16c6be657d59239a35bc089e8a3c80a9c22180498d59"
+  url "https://github.com/DoeringChristian/resh/archive/refs/tags/v0.3.0.tar.gz"
+  sha256 "24d12bdefee5629ad8eb97045d5aa92333916ca276ba0ff1477d4b063b34508c"
   license "MIT"
   head "https://github.com/DoeringChristian/resh.git", branch: "main"
   depends_on "rust" => :build
