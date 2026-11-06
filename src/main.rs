@@ -251,7 +251,7 @@ fn cmd_connect(
         "connect: session loop returned (code {code}, closing={}), starting cleanup",
         signal::is_closing()
     );
-    wal::record_close(&ssh, host, &session_name, &paths);
+    wal::record_close(&ssh, host, &session_name, &paths, signal::is_closing());
     vlog!("connect: cleanup finished");
 
     // Withdrawn explicitly because `exit` runs no destructors.

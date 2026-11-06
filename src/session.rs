@@ -186,6 +186,21 @@ pub fn resolve_session(
     Ok(name)
 }
 
+/// Whether the host still lists this session.
+///
+/// A host that cannot be reached answers `false`: an unreachable host is not
+/// evidence that a session is alive, and treating it as such would strand
+/// whatever is waiting on the answer.
+pub fn session_exists(ssh: &SshContext, host: &str, name: &str, paths: &RemotePaths) -> bool {
+    match list_sessions(ssh, host, &[], paths) {
+        Ok(sessions) => sessions.iter().any(|s| s.name == name),
+        Err(e) => {
+            vlog!("session: cannot tell whether {name} still exists on {host}: {e:#}");
+            false
+        }
+    }
+}
+
 fn match_session<'a>(
     sessions: &'a [SessionEntry],
     host: &str,
@@ -544,6 +559,27 @@ mod tests {
 
     /// A host collects sessions for weeks, so listing them all turns a typo
     /// into a wall of hex. Past a handful the miss points at `list` instead.
+    #[test]
+    fn session_exists_answers_from_the_hosts_list() {
+        let mock = MockSsh::new(
+            "echo '{\"sessions\":[{\"name\":\"mac-a3f21b\",\"status\":\"Attached\"}]}'",
+        );
+        let ctx = make_ctx(&mock);
+
+        assert!(session_exists(&ctx, "fermat", "mac-a3f21b", &paths()));
+        assert!(!session_exists(&ctx, "fermat", "mac-c7e049", &paths()));
+    }
+
+    /// An unreachable host is not evidence that a session is alive. Saying it
+    /// is would turn every failed list into a session nobody ever cleans up.
+    #[test]
+    fn an_unreachable_host_is_not_a_live_session() {
+        let mock = MockSsh::new("echo 'ssh: connect to host fermat port 22: down' >&2\nexit 255");
+        let ctx = make_ctx(&mock);
+
+        assert!(!session_exists(&ctx, "fermat", "mac-a3f21b", &paths()));
+    }
+
     #[test]
     fn a_miss_on_a_crowded_host_points_at_list() {
         let many: Vec<String> = (0..24).map(|i| format!("mac-{i:06x}")).collect();

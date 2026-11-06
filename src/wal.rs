@@ -58,7 +58,13 @@ fn write_entries(entries: &[WalEntry]) -> Result<()> {
 
 /// Record that a session should be closed. Tries to kill immediately;
 /// if that fails the entry stays for replay on next connect.
-pub fn record_close(ssh: &SshContext, host: &str, session_name: &str, paths: &RemotePaths) {
+pub fn record_close(
+    ssh: &SshContext,
+    host: &str,
+    session_name: &str,
+    paths: &RemotePaths,
+    closing: bool,
+) {
     let mut entries = read_entries();
     entries.push(WalEntry {
         host: host.to_string(),
@@ -70,9 +76,32 @@ pub fn record_close(ssh: &SshContext, host: &str, session_name: &str, paths: &Re
     }
     vlog!("wal: recorded close for {host}:{session_name}");
 
+    // Our client exiting is not the same as our session ending. `attach`
+    // detaches whoever held the session first, and that client's shpool exits
+    // 0 -- indistinguishable here from a shell that ran to completion. The
+    // host's own list tells them apart: a shell that exited takes its session
+    // with it, so a session still listed now belongs to the window that just
+    // attached, and killing it would take it straight back off them.
+    if session_was_taken_over(
+        closing,
+        session::session_exists(ssh, host, session_name, paths),
+    ) {
+        vlog!("wal: {session_name} was taken over by another client, leaving it alone");
+        remove_entry(host, session_name);
+        return;
+    }
+
     if session::kill_sessions(ssh, host, &[session_name.to_string()], paths).is_ok() {
         remove_entry(host, session_name);
     }
+}
+
+/// Whether the session outlived our client because somebody else claimed it.
+///
+/// A closing window is never a handoff: its session is meant to die with it,
+/// which is the one case where a live session still has to be killed.
+fn session_was_taken_over(closing: bool, still_listed: bool) -> bool {
+    !closing && still_listed
 }
 
 /// Replay pending close operations for a host. Called on connect.
@@ -185,6 +214,31 @@ mod tests {
             .map(|e| (e.host.as_str(), e.session.as_str()))
             .collect();
         assert_eq!(left, vec![("fermat", "beta"), ("euler", "alpha")]);
+    }
+
+    /// Our client exited but the session is still there, so its shell did not
+    /// end -- another client ran `attach`, which detaches the previous one.
+    /// Killing it now takes the session away from the window that just got it,
+    /// or, if the kill wins the race, leaves that window in a silently
+    /// recreated shell with the old one's work gone.
+    #[test]
+    fn a_session_still_listed_after_our_client_exits_was_taken_over() {
+        assert!(session_was_taken_over(false, true));
+    }
+
+    /// The shell itself exited, so shpool has already dropped the session and
+    /// there is nobody to take it from.
+    #[test]
+    fn a_session_gone_from_the_list_is_ours_to_finish() {
+        assert!(!session_was_taken_over(false, false));
+    }
+
+    /// A window being closed takes its session with it -- that is the whole
+    /// contract of the close path -- so a live session there is not a handoff.
+    #[test]
+    fn a_closing_window_still_kills_its_live_session() {
+        assert!(!session_was_taken_over(true, true));
+        assert!(!session_was_taken_over(true, false));
     }
 
     /// A session that could not be killed must stay pending, but it must not
