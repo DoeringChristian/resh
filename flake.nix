@@ -16,9 +16,9 @@
     in {
       packages.default = pkgs.rustPlatform.buildRustPackage {
         pname = "resh";
-        version = "0.2.0";
+        version = "0.3.0";
         src = ./.;
-        cargoHash = "sha256-kz/BAOnP+hj3gfXoTE7zNLORzqTC0+1iMTLIAXE750A=";
+        cargoHash = "sha256-d/Z2+qPGpOAKr4cWXaqeCO0QIZ+DxqxcHl3b4KpDN1k=";
 
         postInstall = ''
           mkdir -p $out/share/resh/{kitty,shpool}
