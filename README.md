@@ -61,6 +61,10 @@ resh myhost
 # Attach to an existing session (interactive picker)
 resh myhost attach
 
+# Attach to a session by name, or by just the part that varies
+resh myhost attach macbook-a3f21b
+resh myhost attach a3f21b
+
 # Start in a specific directory
 resh --remote-cwd ~/projects myhost
 
@@ -87,7 +91,7 @@ resh --force-upgrade myhost
 resh -v myhost
 ```
 
-The general form is `resh [flags] <host> [subcommand] [args...]`. Session names are randomly generated (e.g. `macbook-a3f21b`). When `kill` or `attach` is run without session names, an interactive picker is shown.
+The general form is `resh [flags] <host> [subcommand] [args...]`. Session names are randomly generated (e.g. `macbook-a3f21b`). When `kill` or `attach` is run without session names, an interactive picker is shown. `attach` accepts a full session name or its trailing part, as long as that matches one session.
 
 ## Shell Support
 

@@ -50,9 +50,19 @@ struct Cli {
     #[arg(required = true)]
     host: String,
 
-    /// Subcommand (list, attach, kill, clean) or extra SSH args
+    /// Subcommand (list, attach [session], kill, clean) or extra SSH args
     #[arg(trailing_var_arg = true)]
     args: Vec<String>,
+}
+
+/// Which session `cmd_connect` runs in.
+enum SessionChoice<'a> {
+    /// A fresh session, named after this client.
+    New,
+    /// One of the host's existing sessions, chosen from a list.
+    Pick,
+    /// The session the user named on the command line.
+    Named(&'a str),
 }
 
 fn main() {
@@ -74,8 +84,16 @@ fn run() -> Result<()> {
     match subcmd {
         Some("list" | "ls") => cmd_list(host, cli.all, &host_cfg),
         Some("attach") => {
-            let ssh_args: Vec<String> = cli.args[1..].to_vec();
-            cmd_connect(host, &ssh_args, true, &cli, host_cfg)
+            // The session name is optional, and SSH arguments may follow it or
+            // stand in its place; a leading dash is what tells them apart.
+            let rest = &cli.args[1..];
+            let named = rest.first().filter(|arg| !arg.starts_with('-'));
+            let ssh_args = if named.is_some() { &rest[1..] } else { rest };
+            let choice = match named {
+                Some(name) => SessionChoice::Named(name),
+                None => SessionChoice::Pick,
+            };
+            cmd_connect(host, ssh_args, choice, &cli, host_cfg)
         }
         Some("kill") => {
             let sessions: Vec<String> = cli.args[1..].to_vec();
@@ -84,7 +102,7 @@ fn run() -> Result<()> {
         Some("clean") => cmd_clean(host, cli.all, &host_cfg),
         _ => {
             let ssh_args = cli.args.clone();
-            cmd_connect(host, &ssh_args, false, &cli, host_cfg)
+            cmd_connect(host, &ssh_args, SessionChoice::New, &cli, host_cfg)
         }
     }
 }
@@ -165,7 +183,7 @@ fn cmd_clean(host: &str, all: bool, host_cfg: &HostConfig) -> Result<()> {
 fn cmd_connect(
     host: &str,
     ssh_args: &[String],
-    attach: bool,
+    want: SessionChoice<'_>,
     cli: &Cli,
     host_cfg: HostConfig,
 ) -> Result<()> {
@@ -191,10 +209,12 @@ fn cmd_connect(
         copy::run_copy_directives(&ssh, host, ssh_args, &host_cfg.copy)?;
     }
 
-    let session_name = if attach {
-        session::pick_session_interactive(&ssh, host, ssh_args, cli.all, &paths)?
-    } else {
-        session::new_session_name(&ssh, host, ssh_args, &paths)?
+    let session_name = match want {
+        SessionChoice::New => session::new_session_name(&ssh, host, ssh_args, &paths)?,
+        SessionChoice::Pick => {
+            session::pick_session_interactive(&ssh, host, ssh_args, cli.all, &paths)?
+        }
+        SessionChoice::Named(name) => session::resolve_session(&ssh, host, ssh_args, name, &paths)?,
     };
 
     // Published only now that there is a session to publish. These variables

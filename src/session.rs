@@ -154,6 +154,85 @@ pub fn pick_session_interactive(
     Ok(name)
 }
 
+/// Resolve a session named on the command line against what the host has.
+///
+/// The check is the point of the command. shpool's own `attach` creates any
+/// session name it does not already know, so passing a name straight through
+/// would answer a typo with a brand new shell rather than the session being
+/// asked for. A name matches in full, or by the hex suffix `list` prints after
+/// the client prefix -- the only part that differs between one client's names.
+pub fn resolve_session(
+    ssh: &SshContext,
+    host: &str,
+    extra_args: &[String],
+    requested: &str,
+    paths: &RemotePaths,
+) -> Result<String> {
+    let sessions = list_sessions(ssh, host, extra_args, paths)?;
+    let entry = match_session(&sessions, host, requested)?;
+
+    // The picker shows each session's status, so whoever uses it can see they
+    // are about to take a session away from another window. A name on the
+    // command line shows nothing, and resh attaches with --force.
+    if entry.status == SessionStatus::Attached {
+        eprintln!(
+            "{}",
+            format!("{} is attached elsewhere; taking it over.", entry.name).yellow()
+        );
+    }
+
+    let name = entry.name.clone();
+    vlog!("session: resolved {requested} = {name}");
+    Ok(name)
+}
+
+fn match_session<'a>(
+    sessions: &'a [SessionEntry],
+    host: &str,
+    requested: &str,
+) -> Result<&'a SessionEntry> {
+    if let Some(exact) = sessions.iter().find(|s| s.name == requested) {
+        return Ok(exact);
+    }
+
+    let suffix = format!("-{requested}");
+    let matches: Vec<&SessionEntry> = sessions
+        .iter()
+        .filter(|s| s.name.ends_with(&suffix))
+        .collect();
+
+    match matches.as_slice() {
+        [only] => Ok(only),
+        [] => bail!(
+            "no session '{requested}' on {host}{}",
+            miss_hint(sessions, host)
+        ),
+        many => bail!(
+            "'{requested}' matches {} sessions on {host}: {}",
+            many.len(),
+            names(many.iter().copied())
+        ),
+    }
+}
+
+/// What a miss can usefully add: the names while they still fit on a line, a
+/// pointer to `list` once a host has collected more than a handful.
+fn miss_hint(sessions: &[SessionEntry], host: &str) -> String {
+    match sessions.len() {
+        0 => " (it has no sessions)".to_string(),
+        n if n <= 6 => format!(" (sessions: {})", names(sessions)),
+        n => format!(" ({n} sessions; try: resh {host} list)"),
+    }
+}
+
+fn names<'a>(sessions: impl IntoIterator<Item = &'a SessionEntry>) -> String {
+    sessions
+        .into_iter()
+        .map(|s| s.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn pick_sessions_to_kill(
     ssh: &SshContext,
     host: &str,
@@ -396,6 +475,107 @@ mod tests {
         assert!(
             msg.contains("ESRCH"),
             "remote stderr must reach the user: {msg}"
+        );
+    }
+
+    fn entries(names: &[&str]) -> Vec<SessionEntry> {
+        names
+            .iter()
+            .map(|n| SessionEntry {
+                name: (*n).to_string(),
+                status: SessionStatus::Disconnected,
+                started_at_unix_ms: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn attach_resolves_a_full_session_name() {
+        let sessions = entries(&["mac-a3f21b", "mac-c7e049"]);
+        assert_eq!(
+            match_session(&sessions, "fermat", "mac-c7e049")
+                .unwrap()
+                .name,
+            "mac-c7e049"
+        );
+    }
+
+    /// Every session one client makes carries the same hostname prefix, so the
+    /// hex suffix is the only part worth typing -- and the only part that
+    /// differs between the names `list` prints.
+    #[test]
+    fn attach_resolves_a_unique_suffix() {
+        let sessions = entries(&["mac-a3f21b", "mac-c7e049"]);
+        assert_eq!(
+            match_session(&sessions, "fermat", "c7e049").unwrap().name,
+            "mac-c7e049"
+        );
+    }
+
+    /// With `-a` the list spans clients, and two of them can land on the same
+    /// suffix. Picking one would be a coin toss, so both are named instead.
+    #[test]
+    fn an_ambiguous_suffix_names_every_candidate() {
+        let sessions = entries(&["mac-a3f21b", "legion-a3f21b"]);
+        let err = match_session(&sessions, "fermat", "a3f21b")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("mac-a3f21b") && err.contains("legion-a3f21b"),
+            "both candidates must be named: {err}"
+        );
+    }
+
+    /// shpool's own `attach` creates whatever name it cannot find, so handing
+    /// it an unchecked name answers a typo with a brand new shell instead of
+    /// the session asked for. A name resh cannot resolve is refused.
+    #[test]
+    fn an_unknown_session_name_is_refused_rather_than_created() {
+        let sessions = entries(&["mac-a3f21b"]);
+        let err = match_session(&sessions, "fermat", "a3f2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a3f2"), "must quote what was asked: {err}");
+        assert!(
+            err.contains("mac-a3f21b"),
+            "and show what the host has: {err}"
+        );
+    }
+
+    /// A host collects sessions for weeks, so listing them all turns a typo
+    /// into a wall of hex. Past a handful the miss points at `list` instead.
+    #[test]
+    fn a_miss_on_a_crowded_host_points_at_list() {
+        let many: Vec<String> = (0..24).map(|i| format!("mac-{i:06x}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let sessions = entries(&refs);
+
+        let err = match_session(&sessions, "fermat", "nope")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("24 sessions"), "must say how many: {err}");
+        assert!(err.contains("resh fermat list"), "and where to look: {err}");
+        assert!(
+            !err.contains("mac-000000"),
+            "but not dump every name: {err}"
+        );
+    }
+
+    #[test]
+    fn resolving_a_name_asks_the_host_for_its_sessions() {
+        let mock = MockSsh::new(
+            "echo '{\"sessions\":[{\"name\":\"mac-a3f21b\",\"status\":\"Disconnected\"}]}'",
+        );
+        let ctx = make_ctx(&mock);
+
+        let name = resolve_session(&ctx, "fermat", &[], "a3f21b", &paths()).unwrap();
+
+        assert_eq!(name, "mac-a3f21b");
+        let calls = mock.calls();
+        assert!(
+            calls.iter().any(|c| c.contains("list --json")),
+            "must resolve against the host's list: {calls:?}"
         );
     }
 
