@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use std::fs;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::vlog;
 
@@ -76,6 +78,10 @@ impl SshContext {
             "ServerAliveInterval=10".into(),
             "-o".into(),
             "ServerAliveCountMax=3".into(),
+            // The keepalives only start once a connection exists. Without this
+            // a TCP connect into a black hole waits for the OS timeout (~75s).
+            "-o".into(),
+            "ConnectTimeout=15".into(),
         ]
     }
 
@@ -93,10 +99,20 @@ impl SshContext {
 
     /// Pre-flight check: if the control master is dead but its socket lingers,
     /// remove the stale socket so the next connection can create a fresh master.
+    ///
+    /// The check is bounded: it is just another ssh process, and an ssh that
+    /// wedges here would hang the reconnect loop exactly like a wedged
+    /// interactive one. A check that times out proves nothing about the master,
+    /// so its socket is left alone.
     pub fn clean_stale_master(&self, host: &str, extra_args: &[String]) {
-        let check = self.control_cmd("check", host, extra_args).status();
-        if !matches!(check, Ok(s) if s.success()) {
+        let Ok(mut child) = self.control_cmd("check", host, extra_args).spawn() else {
             self.remove_stale_sockets(host);
+            return;
+        };
+        match wait_with_deadline(&mut child, CONTROL_CHECK_DEADLINE) {
+            Some(s) if s.success() => {}
+            Some(_) => self.remove_stale_sockets(host),
+            None => vlog!("ssh: control check hung, leaving the socket alone"),
         }
     }
 
@@ -131,12 +147,14 @@ impl SshContext {
         cmd.stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        close_inherited_fds_on_exec();
         let mut child = cmd.spawn().context("failed to execute ssh")?;
         // Expose the child so a close signal can terminate it and let us run the
         // direct remote-session kill immediately instead of deferring to the WAL.
         crate::signal::set_ssh_child(child.id() as i32);
         nudge_terminal_size();
-        let status = child.wait().context("failed to wait for ssh");
+        let status = wait_with_connect_watchdog(&mut child, CONNECT_DEADLINE, ssh_made_progress)
+            .context("failed to wait for ssh");
         crate::signal::set_ssh_child(0);
         status
     }
@@ -233,6 +251,178 @@ impl SshContext {
 
 /// Translate ssh-style args to scp-style. scp uses `-P` (capital) for the
 /// port; lowercase `-p` would mean "preserve times" instead.
+/// How long an ssh attempt may go without opening any connection before it is
+/// treated as wedged.
+const CONNECT_DEADLINE: Duration = Duration::from_secs(20);
+const CONTROL_CHECK_DEADLINE: Duration = Duration::from_secs(10);
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Wait for an interactive ssh, abandoning it if it wedges before connecting.
+///
+/// macOS's ssh has been seen to hang forever before opening a single socket,
+/// typically while name resolution is broken (Tailscale DNS going away): the
+/// main thread blocks on a system semaphore and no timeout in ssh covers that
+/// phase. The reconnect loop only runs when ssh exits, so the window froze for
+/// good -- keys were echoed by the tty and reached nobody.
+///
+/// Until `progressed` reports that ssh got somewhere -- any socket of its own
+/// or a child process such as a ProxyCommand -- the child is polled; past the
+/// deadline it is killed and reported as an ssh failure (255), which sends the
+/// reconnect loop down its normal retry path. Once it has progressed this is a
+/// plain `wait`, so a slow password prompt or a long session is never touched.
+/// Killing this local ssh cannot detach anything: it never reached the remote.
+pub(crate) fn wait_with_connect_watchdog(
+    child: &mut Child,
+    deadline: Duration,
+    progressed: impl Fn(i32) -> bool,
+) -> std::io::Result<ExitStatus> {
+    let pid = child.id() as i32;
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if progressed(pid) {
+            return child.wait();
+        }
+        if start.elapsed() >= deadline {
+            eprintln!(
+                "\r\nssh made no connection in {}s and looks stuck; abandoning this attempt.\r",
+                deadline.as_secs()
+            );
+            kill_hard(child);
+            return Ok(ExitStatus::from_raw(255 << 8));
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Wait up to `deadline`; on timeout kill the child and return `None`.
+fn wait_with_deadline(child: &mut Child, deadline: Duration) -> Option<ExitStatus> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if start.elapsed() < deadline => std::thread::sleep(POLL_INTERVAL),
+            _ => {
+                kill_hard(child);
+                return None;
+            }
+        }
+    }
+}
+
+/// SIGTERM, then SIGKILL if that is not enough, then reap.
+fn kill_hard(child: &mut Child) {
+    let pid = child.id() as i32;
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(1) {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Stop file descriptors resh inherited (from the terminal, a launcher...)
+/// from passing on to ssh. ssh needs only stdio, and an inherited socket would
+/// make a wedged ssh look connected to `ssh_made_progress`, silently disabling
+/// the watchdog. Everything resh opens itself is close-on-exec already.
+fn close_inherited_fds_on_exec() {
+    let max = unsafe { libc::getdtablesize() }.clamp(3, 65536);
+    for fd in 3..max {
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
+/// Whether an ssh process has started talking to anything: a socket of its own
+/// (TCP, or the control master's unix socket) or a child process (ProxyCommand
+/// and ProxyJump talk through pipes to a helper, which holds the socket).
+pub(crate) fn ssh_made_progress(pid: i32) -> bool {
+    has_socket(pid) || has_children(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn has_socket(pid: i32) -> bool {
+    let size = std::mem::size_of::<libc::proc_fdinfo>();
+    let mut fds: Vec<libc::proc_fdinfo> = Vec::with_capacity(256);
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr() as *mut libc::c_void,
+            (fds.capacity() * size) as libc::c_int,
+        )
+    };
+    if bytes <= 0 {
+        // Cannot tell; never kill on a guess.
+        return true;
+    }
+    unsafe { fds.set_len(bytes as usize / size) };
+    // stdio is excluded: it is whatever resh was given, a socket under some
+    // launchers, and never the connection ssh made.
+    fds.iter()
+        .any(|fd| fd.proc_fd > 2 && fd.proc_fdtype == libc::PROX_FDTYPE_SOCKET as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn has_children(pid: i32) -> bool {
+    let mut pids = [0 as libc::pid_t; 16];
+    let n = unsafe {
+        libc::proc_listchildpids(
+            pid,
+            pids.as_mut_ptr() as *mut libc::c_void,
+            std::mem::size_of_val(&pids) as libc::c_int,
+        )
+    };
+    n != 0
+}
+
+#[cfg(target_os = "linux")]
+fn has_socket(pid: i32) -> bool {
+    let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return true;
+    };
+    entries.flatten().any(|e| {
+        let is_stdio = e
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+            .is_some_and(|n| n <= 2);
+        !is_stdio
+            && fs::read_link(e.path())
+                .map(|t| t.to_string_lossy().starts_with("socket:"))
+                .unwrap_or(false)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn has_children(pid: i32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
+        Ok(s) => !s.trim().is_empty(),
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn has_socket(_pid: i32) -> bool {
+    true
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn has_children(_pid: i32) -> bool {
+    true
+}
+
 fn translate_for_scp(args: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
     let mut i = 0;
@@ -369,6 +559,100 @@ mod tests {
             dir = mock.dir.display()
         );
         fs::write(&mock.script_path, script).unwrap();
+    }
+
+    // ---- connect watchdog ----
+
+    /// The incident: an ssh wedged before connecting never exits, so the
+    /// reconnect loop never runs and the window is frozen for good.
+    #[test]
+    fn watchdog_abandons_an_ssh_that_never_connects() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let start = Instant::now();
+        let status =
+            wait_with_connect_watchdog(&mut child, Duration::from_millis(300), |_| false).unwrap();
+        assert_eq!(status.code(), Some(255), "reported as an ssh failure");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(child.try_wait().unwrap().is_some(), "child was reaped");
+    }
+
+    /// Once ssh has a connection, a long session or slow password prompt must
+    /// never be cut off by the deadline.
+    #[test]
+    fn watchdog_leaves_a_connected_ssh_alone() {
+        let mut child = Command::new("sleep").arg("1").spawn().unwrap();
+        let status =
+            wait_with_connect_watchdog(&mut child, Duration::from_millis(100), |_| true).unwrap();
+        assert!(status.success(), "ran to completion, got {status:?}");
+    }
+
+    #[test]
+    fn watchdog_passes_through_an_early_exit() {
+        let mut child = Command::new("sh").args(["-c", "exit 3"]).spawn().unwrap();
+        let status =
+            wait_with_connect_watchdog(&mut child, Duration::from_secs(5), |_| false).unwrap();
+        assert_eq!(status.code(), Some(3));
+    }
+
+    #[test]
+    fn a_process_with_no_socket_and_no_children_has_not_progressed() {
+        // As run_interactive does: the test runner may hand us its sockets.
+        close_inherited_fds_on_exec();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let pid = child.id() as i32;
+        let (sock, kids) = (has_socket(pid), has_children(pid));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!sock && !kids, "socket={sock} children={kids}");
+    }
+
+    /// ProxyCommand/ProxyJump: ssh talks to a helper over pipes, so the socket
+    /// lives in the child.
+    #[test]
+    fn a_process_with_a_child_has_progressed() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30; true"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let progressed = ssh_made_progress(child.id() as i32);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(progressed);
+    }
+
+    // The socket lives in a separate process: one opened in this test binary
+    // could leak into a child another test thread forks at that moment (macOS
+    // sets close-on-exec only after the socket exists).
+    #[test]
+    fn a_process_holding_a_socket_has_progressed() {
+        let mut child = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                "import socket,time; s=socket.socket(); time.sleep(30)",
+            ])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start = Instant::now();
+        let mut seen = false;
+        while !seen && start.elapsed() < Duration::from_secs(10) {
+            seen = has_socket(pid);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(seen);
+    }
+
+    #[test]
+    fn run_interactive_sets_a_connect_timeout() {
+        let mock = MockSsh::new("exit 0");
+        let ctx = make_ctx(&mock);
+        ctx.run_interactive("host", &[], None).unwrap();
+        assert!(mock.calls()[0].contains("ConnectTimeout="));
     }
 
     // ---- clean_stale_master ----
@@ -533,7 +817,7 @@ mod tests {
                 ctx.clean_stale_master("fermat", &[]);
                 error_fired.store(true, std::sync::atomic::Ordering::SeqCst);
             },
-            || panic!("immediate retry should succeed without prompting"),
+            |_| panic!("immediate retry should succeed without prompting"),
             || false,
         );
 
@@ -556,7 +840,7 @@ mod tests {
             || {
                 master_killed.store(true, std::sync::atomic::Ordering::SeqCst);
             },
-            || panic!("should not wait"),
+            |_| panic!("should not wait"),
             || false,
         );
 
@@ -582,7 +866,7 @@ mod tests {
                 ctx.clean_stale_master("fermat", &[]);
                 error_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
-            || {
+            |_| {
                 wait_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 true
             },

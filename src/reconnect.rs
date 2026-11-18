@@ -2,6 +2,7 @@ use anyhow::Result;
 use owo_colors::OwoColorize;
 use std::io::Read;
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::Duration;
 
 /// Escape sequences that put the terminal back to a sane state.
 ///
@@ -75,6 +76,12 @@ where
     )
 }
 
+/// Delay before the `n`th automatic retry (1-based) after the connection
+/// itself failed: 2s, 4s, 8s, 16s, then every 30s for as long as it takes.
+pub(crate) fn retry_delay(n: u32) -> Duration {
+    Duration::from_secs((1u64 << n.min(5)).min(30))
+}
+
 pub(crate) fn run_reconnect_loop<F, B, W, C>(
     connect: F,
     on_ssh_error: B,
@@ -84,11 +91,12 @@ pub(crate) fn run_reconnect_loop<F, B, W, C>(
 where
     F: Fn() -> Result<ExitStatus>,
     B: Fn(),
-    W: Fn() -> bool,
+    W: Fn(Option<Duration>) -> bool,
     C: Fn() -> bool,
 {
     let mut last_failure = 1;
     let mut attempt: u32 = 0;
+    let mut ssh_failures: u32 = 0;
     loop {
         attempt += 1;
         let mut status = connect()?;
@@ -129,12 +137,27 @@ where
                 .yellow()
                 .bold()
         );
-        eprintln!(
-            "{}",
-            "Press any key to retry, Ctrl-C to quit.".yellow().bold()
-        );
+        // A lost connection (DNS gone, network switching, VPN reconnecting)
+        // usually heals by itself, so it is retried without anyone at the
+        // keyboard. A remote command that failed would only fail again, so
+        // that still waits for a key.
+        let auto_retry = if status.code() == Some(255) {
+            ssh_failures += 1;
+            Some(retry_delay(ssh_failures))
+        } else {
+            ssh_failures = 0;
+            None
+        };
+        let hint = match auto_retry {
+            Some(d) => format!(
+                "Retrying in {}s; press any key to retry now, Ctrl-C to quit.",
+                d.as_secs()
+            ),
+            None => "Press any key to retry, Ctrl-C to quit.".to_string(),
+        };
+        eprintln!("{}", hint.yellow().bold());
 
-        if !wait() {
+        if !wait(auto_retry) {
             return Ok(last_failure);
         }
 
@@ -153,7 +176,11 @@ where
 /// The input queue is flushed afterwards: one keypress can produce several
 /// bytes, and the remainder would otherwise be delivered to the reconnected
 /// session as if typed.
-fn wait_for_keypress() -> bool {
+///
+/// With a `timeout`, returns true once it elapses without a key, so the caller
+/// retries on its own. A close signal arriving meanwhile ends the wait (false)
+/// so the close path runs instead of another connection attempt.
+fn wait_for_keypress(timeout: Option<Duration>) -> bool {
     let fd = libc::STDIN_FILENO;
     let mut saved: libc::termios = unsafe { std::mem::zeroed() };
     let is_tty = unsafe { libc::tcgetattr(fd, &mut saved) } == 0;
@@ -166,8 +193,13 @@ fn wait_for_keypress() -> bool {
         unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) };
     }
 
-    let mut buf = [0u8; 1];
-    let got = std::io::stdin().read(&mut buf);
+    let outcome = match timeout {
+        None => {
+            let mut buf = [0u8; 1];
+            matches!(std::io::stdin().read(&mut buf), Ok(1..))
+        }
+        Some(timeout) => wait_readable_or_timeout(fd, timeout),
+    };
 
     if is_tty {
         unsafe {
@@ -176,7 +208,39 @@ fn wait_for_keypress() -> bool {
         }
     }
 
-    matches!(got, Ok(1..))
+    outcome
+}
+
+/// True on a key or once `timeout` passes; false on EOF, error or a close signal.
+fn wait_readable_or_timeout(fd: libc::c_int, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if crate::signal::is_closing() {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Short slices so a close signal is noticed even where poll restarts.
+        let ms = left.as_millis().min(250) as libc::c_int;
+        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if n > 0 {
+            let mut buf = [0u8; 1];
+            return matches!(std::io::stdin().read(&mut buf), Ok(1..));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -303,7 +367,7 @@ mod tests {
             || {
                 errors.fetch_add(1, Ordering::SeqCst);
             },
-            || panic!("should not wait for keypress"),
+            |_| panic!("should not wait for keypress"),
             || false,
         );
 
@@ -319,7 +383,7 @@ mod tests {
         let result = run_reconnect_loop(
             || seq.connect(),
             || panic!("should not call on_ssh_error"),
-            || panic!("should not wait"),
+            |_| panic!("should not wait"),
             || true, // closing
         );
 
@@ -337,7 +401,7 @@ mod tests {
             || {
                 errors.fetch_add(1, Ordering::SeqCst);
             },
-            || false, // user quits
+            |_| false, // user quits
             || false,
         );
 
@@ -361,7 +425,7 @@ mod tests {
             || {
                 errors.fetch_add(1, Ordering::SeqCst);
             },
-            || panic!("immediate retry should succeed, no prompt needed"),
+            |_| panic!("immediate retry should succeed, no prompt needed"),
             || false,
         );
 
@@ -381,7 +445,7 @@ mod tests {
             || {
                 errors.fetch_add(1, Ordering::SeqCst);
             },
-            || false, // user quits
+            |_| false, // user quits
             || false,
         );
 
@@ -402,7 +466,7 @@ mod tests {
             || {
                 errors.fetch_add(1, Ordering::SeqCst);
             },
-            || true, // user keeps retrying
+            |_| true, // user keeps retrying
             || false,
         );
 
@@ -423,7 +487,7 @@ mod tests {
             || {
                 errors.fetch_add(1, Ordering::SeqCst);
             },
-            || {
+            |_| {
                 waits.fetch_add(1, Ordering::SeqCst);
                 true
             },
@@ -455,7 +519,7 @@ mod tests {
             || {
                 errors.fetch_add(1, Ordering::SeqCst);
             },
-            || panic!("signal should prevent prompt"),
+            |_| panic!("signal should prevent prompt"),
             || closing.load(Ordering::SeqCst),
         );
 
@@ -464,12 +528,62 @@ mod tests {
         assert_eq!(errors.load(Ordering::SeqCst), 1);
     }
 
+    /// A lost connection heals by itself (DNS back, VPN up), so nobody should
+    /// have to be at the keyboard: the loop asks for a timed wait, backing off.
+    #[test]
+    fn lost_connection_is_retried_automatically_with_backoff() {
+        let seq = ConnectSequence::new(vec![255, 255, 255, 255, 0]);
+        let asked = std::sync::Mutex::new(Vec::new());
+
+        let result = run_reconnect_loop(
+            || seq.connect(),
+            || {},
+            |t| {
+                asked.lock().unwrap().push(t);
+                true
+            },
+            || false,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![Some(retry_delay(1)), Some(retry_delay(2))]
+        );
+    }
+
+    /// A failing remote command would only fail again; keep waiting for a key.
+    #[test]
+    fn remote_failure_waits_for_a_key() {
+        let seq = ConnectSequence::new(vec![1, 0]);
+        let asked = std::sync::Mutex::new(Vec::new());
+
+        run_reconnect_loop(
+            || seq.connect(),
+            || {},
+            |t| {
+                asked.lock().unwrap().push(t);
+                true
+            },
+            || false,
+        )
+        .unwrap();
+
+        assert_eq!(*asked.lock().unwrap(), vec![None]);
+    }
+
+    #[test]
+    fn retry_delay_backs_off_and_caps() {
+        let secs: Vec<u64> = (1..=8).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, vec![2, 4, 8, 16, 30, 30, 30, 30]);
+    }
+
     #[test]
     fn connect_error_propagates() {
         let result = run_reconnect_loop(
             || Err(anyhow::anyhow!("ssh not found")),
             || panic!("should not call on_ssh_error"),
-            || panic!("should not wait"),
+            |_| panic!("should not wait"),
             || false,
         );
 
@@ -488,7 +602,7 @@ mod tests {
             || {
                 errors.fetch_add(1, Ordering::SeqCst);
             },
-            || true,
+            |_| true,
             || false,
         );
 
@@ -513,7 +627,7 @@ mod tests {
             || {
                 errors.fetch_add(1, Ordering::SeqCst);
             },
-            || panic!("should not wait"),
+            |_| panic!("should not wait"),
             || false,
         );
 
@@ -544,7 +658,7 @@ mod tests {
             || {
                 master_alive.store(false, Ordering::SeqCst);
             },
-            || panic!("immediate retry should succeed"),
+            |_| panic!("immediate retry should succeed"),
             || false,
         );
 
